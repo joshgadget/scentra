@@ -5,6 +5,7 @@
   "scripts": {
     "dev": "tsx watch src/index.js",
     "start": "node src/index.js",
+    "build": "prisma generate",
     "prisma:generate": "prisma generate",
     "db:push": "prisma db push"
   },
