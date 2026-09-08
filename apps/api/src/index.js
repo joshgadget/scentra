@@ -14,6 +14,7 @@ if (process.env.NODE_ENV !== 'production') globalThis.__scentraPrisma = prisma
 const dbEnabled = Boolean(process.env.DATABASE_URL)
 const deliveryDefaults = { enabled:true, freeOver:75000, lagos:4000, other:12000 }
 const memoryOrders = []
+const memoryCustomers = new Map()
 const memoryCoupons = [{ id:'welcome', code:'WELCOME10', type:'percent', value:10, expiryDate:'2027-12-31T23:59:59.000Z', usageLimit:500, usedCount:0, active:true }]
 const memorySubscribers = new Set()
 const memorySettings = {
@@ -142,8 +143,106 @@ const adminAuth = (req, res, next) => { try { const token = req.headers.authoriz
 const cachePublic = (res, seconds = 30) => res.set('Cache-Control', `public, max-age=0, s-maxage=${seconds}, stale-while-revalidate=${seconds * 10}`)
 const cachePrivate = (res) => res.set('Cache-Control', 'private, no-store')
 
+const supabaseUrl = (process.env.SUPABASE_URL || '').replace(/\/+$/, '')
+const supabaseReady = Boolean(supabaseUrl && process.env.SUPABASE_ANON_KEY)
+const supabaseAuthHeaders = (key) => ({ apikey:key, Authorization:`Bearer ${key}`, 'Content-Type':'application/json' })
+
+async function supabaseRequest(path, options = {}) {
+  const response = await fetch(`${supabaseUrl}${path}`, options)
+  const data = await response.json().catch(() => ({}))
+  if (!response.ok) throw new Error(data.error_description || data.msg || data.error || 'Supabase request failed')
+  return data
+}
+
+async function ensureCustomerFor(auth) {
+  const name = auth.name || (auth.email ? auth.email.split('@')[0] : 'Scentra customer')
+  if (!dbEnabled) {
+    const existing = memoryCustomers.get(auth.email)
+    const customer = existing || { id:auth.email, name, email:auth.email, phone:null, createdAt:new Date().toISOString() }
+    memoryCustomers.set(auth.email, customer)
+    return customer
+  }
+  return prisma.customer.upsert({ where:{ email:auth.email }, update:{}, create:{ name, email:auth.email } })
+}
+
+const customerAuth = async (req, res, next) => {
+  const token = req.headers.authorization?.replace('Bearer ', '')
+  if (!token) return res.status(401).json({ error:'Please sign in to continue' })
+  try {
+    let payload
+    if (process.env.SUPABASE_JWT_SECRET) {
+      payload = jwt.verify(token, process.env.SUPABASE_JWT_SECRET, { algorithms:['HS256'] })
+    } else if (supabaseReady) {
+      const user = await supabaseRequest('/auth/v1/user', { headers:{ apikey:process.env.SUPABASE_ANON_KEY, Authorization:`Bearer ${token}` } })
+      payload = { sub:user.id, email:user.email, aud:user.aud }
+    } else {
+      return res.status(503).json({ error:'Customer accounts are not configured yet' })
+    }
+    if (payload.aud !== 'authenticated' || !payload.sub) throw new Error('Invalid session')
+    req.customer = { id:payload.sub, email:String(payload.email || '').toLowerCase() }
+    next()
+  } catch (error) { res.status(401).json({ error:'Your session has expired. Please sign in again.' }) }
+}
+
+const serializeOrder = (order) => ({ orderNumber:order.orderNumber, status:order.status, total:order.total, deliveryFee:order.deliveryFee || 0, createdAt:order.createdAt, items:order.items || [] })
+const accountSchema = z.object({ name:z.string().trim().min(1).max(80), email:z.string().trim().toLowerCase().email().max(200), password:z.string().min(8).max(100) })
+const signInSchema = z.object({ email:z.string().trim().toLowerCase().email(), password:z.string().min(8).max(100) })
+const refreshSchema = z.object({ refreshToken:z.string().trim().min(10).max(500) })
+
+app.post('/api/auth/signup', async (req, res) => {
+  const parsed = accountSchema.safeParse(req.body)
+  if (!parsed.success) return res.status(400).json({ error:'Enter your name, a valid email and a password of at least 8 characters' })
+  if (!supabaseReady || !process.env.SUPABASE_SERVICE_ROLE_KEY) return res.status(503).json({ error:'Accounts are not ready yet - connect Supabase to enable signup.' })
+  const { name, email, password } = parsed.data
+  try {
+    await supabaseRequest('/auth/v1/admin/users', { method:'POST', headers:supabaseAuthHeaders(process.env.SUPABASE_SERVICE_ROLE_KEY), body:JSON.stringify({ email, password, email_confirm:true, user_metadata:{ name } }) })
+    if (dbEnabled) await prisma.customer.upsert({ where:{ email }, update:{ name }, create:{ name, email } })
+    else memoryCustomers.set(email, { id:email, name, email, phone:null, createdAt:new Date().toISOString() })
+    cachePrivate(res).status(201).json({ message:'Account created. Signing you in...' })
+  } catch (error) { res.status(409).json({ error:error.message === 'User already registered' ? 'An account already exists for this email. Sign in instead.' : (error.message || 'Could not create your account') }) }
+})
+
+app.post('/api/auth/login', async (req, res) => {
+  const parsed = signInSchema.safeParse(req.body)
+  if (!parsed.success) return res.status(400).json({ error:'Enter your email and a password of at least 8 characters' })
+  if (!supabaseReady) return res.status(503).json({ error:'Accounts are not ready yet - connect Supabase to sign in.' })
+  const { email, password } = parsed.data
+  try {
+    const session = await supabaseRequest('/auth/v1/token?grant_type=password', { method:'POST', headers:supabaseAuthHeaders(process.env.SUPABASE_ANON_KEY), body:JSON.stringify({ email, password }) })
+    const customer = await ensureCustomerFor({ email:session.user?.email || email, name:session.user?.user_metadata?.name })
+    cachePrivate(res).json({ token:session.access_token, refreshToken:session.refresh_token, user:{ id:session.user?.id, email:customer.email, name:customer.name } })
+  } catch (error) { res.status(401).json({ error:error.message === 'Invalid login credentials' ? 'Incorrect email or password' : (error.message || 'Could not sign you in') }) }
+})
+
+app.post('/api/auth/refresh', async (req, res) => {
+  const parsed = refreshSchema.safeParse(req.body)
+  if (!parsed.success) return res.status(400).json({ error:'Refresh token is missing' })
+  if (!supabaseReady) return res.status(503).json({ error:'Accounts are not configured yet' })
+  try {
+    const session = await supabaseRequest('/auth/v1/token?grant_type=refresh_token', { method:'POST', headers:supabaseAuthHeaders(process.env.SUPABASE_ANON_KEY), body:JSON.stringify({ refresh_token:parsed.data.refreshToken }) })
+    cachePrivate(res).json({ token:session.access_token, refreshToken:session.refresh_token, user:{ id:session.user?.id, email:session.user?.email || '', name:session.user?.user_metadata?.name || '' } })
+  } catch (error) { res.status(401).json({ error:'Session expired. Please sign in again.' }) }
+})
+
+app.get('/api/auth/me', customerAuth, async (req, res) => {
+  try {
+    const customer = await ensureCustomerFor(req.customer)
+    cachePrivate(res).json({ user:{ id:req.customer.id, email:customer.email, name:customer.name, phone:customer.phone || null, createdAt:customer.createdAt } })
+  } catch (error) { res.status(500).json({ error:'Could not load your profile' }) }
+})
+
+app.get('/api/account/orders', customerAuth, async (req, res) => {
+  try {
+    const customer = await ensureCustomerFor(req.customer)
+    const orders = dbEnabled
+      ? await prisma.order.findMany({ where:{ customerId:customer.id }, include:{ items:{ select:{ name:true, size:true, qty:true, price:true } } }, orderBy:{ createdAt:'desc' } })
+      : memoryOrders.filter((order) => order.customerEmail === customer.email)
+    cachePrivate(res).json({ orders:orders.map(serializeOrder) })
+  } catch (error) { res.status(500).json({ error:'Could not load your orders' }) }
+})
+
 async function listCustomers() {
-  if (dbEnabled) return prisma.customer.findMany({ include:{ orders:{ select:{ id:true, orderNumber:true, total:true, status:true, createdAt:true } } }, orderBy:{ createdAt:'desc' } })
+  if (dbEnabled) return prisma.customer.findMany({ select:{ id:true, name:true, email:true, phone:true, createdAt:true, orders:{ select:{ id:true, orderNumber:true, total:true, status:true, createdAt:true } } }, orderBy:{ createdAt:'desc' } })
   return [...new Set(memoryOrders.map((order) => order.customerEmail))].map((email) => {
     const orders = memoryOrders.filter((order) => order.customerEmail === email)
     return { id:email, email, name:orders[0].customerName, phone:orders[0].customerPhone, createdAt:orders[orders.length-1].createdAt, orders }
@@ -162,7 +261,7 @@ async function getSummary() {
 app.get('/api/health', (_, res) => cachePrivate(res).json({ ok:true, database:dbEnabled ? 'postgresql' : 'memory', readyForLive:dbEnabled && Boolean(process.env.PAYSTACK_SECRET_KEY) && Boolean(process.env.JWT_SECRET) }))
 app.get('/api/config', async (_, res) => {
   const delivery = await getSetting('delivery').catch(() => deliveryDefaults)
-  cachePrivate(res).json({ paymentMode:process.env.PAYSTACK_SECRET_KEY ? 'live' : 'demo', paymentProvider:'Paystack', database:dbEnabled ? 'postgresql' : 'memory', delivery:{ ...deliveryDefaults, ...delivery }, support:{ email:'hello@scentra.co', whatsapp:process.env.OWNER_WHATSAPP || '' } })
+  cachePrivate(res).json({ paymentMode:process.env.PAYSTACK_SECRET_KEY ? 'live' : 'demo', paymentProvider:'Paystack', database:dbEnabled ? 'postgresql' : 'memory', accounts:{ provider:'supabase', ready:supabaseReady }, delivery:{ ...deliveryDefaults, ...delivery }, support:{ email:'hello@scentra.co', whatsapp:process.env.OWNER_WHATSAPP || '' } })
 })
 app.get('/api/categories', (_, res) => cachePublic(res, 3600).json([
   { name:'Custom Perfumes', slug:'custom-perfumes', eyebrow:'Made by us', description:'Small-batch signatures blended in Lagos.' },
