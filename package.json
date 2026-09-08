@@ -1,0 +1,20 @@
+{
+    "name":  "scentra-luxury-commerce",
+    "private":  true,
+    "workspaces":  [
+                       "apps/*"
+                   ],
+    "scripts":  {
+                    "dev":  "concurrently -k \"npm:dev:api\" \"npm:dev:web\"",
+                    "dev:web":  "npm --workspace apps/web run dev",
+                    "dev:api":  "npm --workspace apps/api run dev",
+                    "build":  "npm run prisma:generate \u0026\u0026 npm --workspace apps/web run build",
+                    "start:api":  "npm --workspace apps/api run start",
+                    "prisma:generate":  "npm --workspace apps/api run prisma:generate",
+                    "db:push":  "npm --workspace apps/api run db:push"
+                },
+    "devDependencies":  {
+                            "concurrently":  "^9.1.2"
+                        },
+    "type":  "module"
+}

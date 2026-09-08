@@ -1,0 +1,28 @@
+.track-page{padding-bottom:5rem}
+.track-hero{text-align:center;padding:3.5rem 0 1.5rem}
+.track-hero .eyebrow{color:var(--muted,#8a7361);letter-spacing:.18em;text-transform:uppercase;font-size:.72rem;font-weight:600}
+.track-hero h1{font-size:clamp(1.8rem,4vw,2.6rem);line-height:1.1;margin:.4rem 0 .6rem}
+.track-hero p{color:var(--muted,#8a7361);max-width:34rem;margin:0 auto}
+.track-body{max-width:44rem}
+.track-form{display:grid;gap:.8rem;grid-template-columns:1fr auto;align-items:end;background:var(--card,#fff);border:1px solid var(--line,#eadfce);border-radius:1rem;padding:1.2rem;margin:1.5rem 0}
+.track-form label{display:grid;gap:.4rem;font-weight:600;font-size:.85rem}
+.track-form input{border:1px solid var(--line,#eadfce);border-radius:.6rem;padding:.7rem .9rem;font:inherit}
+.track-form .form-error{grid-column:1/-1;margin:0}
+.track-result{background:var(--card,#fff);border:1px solid var(--line,#eadfce);border-radius:1rem;padding:1.4rem}
+.track-head{display:flex;justify-content:space-between;align-items:flex-start;gap:1rem;border-bottom:1px dashed var(--line,#eadfce);padding-bottom:1rem}
+.track-head span{font-size:.72rem;letter-spacing:.14em;color:var(--muted,#8a7361);font-weight:700}
+.track-head h2{margin:.25rem 0 0;font-size:1.3rem}
+.track-head strong{white-space:nowrap}
+.track-steps{list-style:none;margin:0;padding:1.1rem 0 .4rem;display:grid;gap:0}
+.track-steps li{display:grid;grid-template-columns:1.7rem 1fr;gap:.7rem;position:relative;padding-bottom:1.15rem}
+.track-steps li:not(:last-child):before{content:'';position:absolute;left:.52rem;top:1.35rem;bottom:.15rem;width:1px;background:var(--line,#eadfce)}
+.track-steps li.done:not(:last-child):before{background:var(--accent,#8a5a3b)}
+.track-dot{width:1.1rem;height:1.1rem;border-radius:50%;border:1px solid var(--line,#eadfce);display:flex;align-items:center;justify-content:center;font-size:.6rem;color:#fff;background:#fff;margin-top:.2rem}
+.track-steps li.done .track-dot{background:var(--accent,#8a5a3b);border-color:var(--accent,#8a5a3b)}
+.track-steps li div strong{display:block;font-size:.95rem}
+.track-steps li div small{color:var(--muted,#8a7361);font-size:.8rem}
+.track-steps li:not(.done) div strong{color:var(--muted,#8a7361)}
+.track-total{display:flex;justify-content:space-between;border-top:1px dashed var(--line,#eadfce);padding-top:1rem;margin:0}
+.track-note{color:var(--muted,#8a7361);margin:.5rem 0 0}
+.checkbox-row{display:flex;align-items:center;gap:.5rem;cursor:pointer;font-weight:500}
+.checkbox-row input{width:auto}
