@@ -3,7 +3,7 @@ import{LogOut,Package,ShieldCheck,User}from'lucide-react'
 
 const SESSION_KEY='scentra-customer'
 const statusLabels={PENDING:'Placed',PAID:'Paid',PROCESSING:'Processing',SHIPPED:'Shipped',DELIVERED:'Delivered',CANCELLED:'Cancelled'}
-const money=(value=0)=>'\u20A6'+new Intl.NumberFormat('en-NG').format(Number(value)||0)
+const money=(value=0)=>'₦'+new Intl.NumberFormat('en-NG').format(Number(value)||0)
 
 function loadSession(){try{return JSON.parse(localStorage.getItem(SESSION_KEY)||'null')}catch{return null}}
 function saveSession(session){localStorage.setItem(SESSION_KEY,JSON.stringify(session))}

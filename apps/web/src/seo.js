@@ -13,7 +13,7 @@ const editorialTitles = {
 
 function setMeta(attr, name, content) {
   if (!content) return
-  let tag = document.head.querySelector(`meta[${attr}=${name}]`)
+  let tag = document.head.querySelector(`meta[${attr}="${name}"]`)
   if (!tag) {
     tag = document.createElement('meta')
     tag.setAttribute(attr, name)

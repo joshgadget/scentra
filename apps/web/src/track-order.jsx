@@ -1,6 +1,6 @@
 import { useState } from 'react'
 
-const money = (value = 0) => '\u20A6' + new Intl.NumberFormat('en-NG').format(Number(value) || 0)
+const money = (value = 0) => '₦' + new Intl.NumberFormat('en-NG').format(Number(value) || 0)
 
 const steps = [
   ['PENDING', 'Order placed', 'We received your order and are confirming it.'],
@@ -72,7 +72,7 @@ export function TrackOrderPage() {
             <ol className='track-steps'>
               {steps.map(([status, label, hint], index) => (
                 <li key={status} className={index <= currentStep ? 'done' : ''}>
-                  <span className='track-dot'>{index < currentStep || index === currentStep ? '\u2713' : ''}</span>
+                  <span className='track-dot'>{index < currentStep || index === currentStep ? '✓' : ''}</span>
                   <div>
                     <strong>{label}</strong>
                     <small>{hint}</small>

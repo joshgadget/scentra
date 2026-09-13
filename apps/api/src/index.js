@@ -11,7 +11,8 @@ const port = process.env.PORT || 4000
 const appUrl = process.env.APP_URL || (process.env.VERCEL_URL ? 'https://' + process.env.VERCEL_URL : 'http://localhost:5173')
 const prisma = globalThis.__scentraPrisma || new PrismaClient()
 if (process.env.NODE_ENV !== 'production') globalThis.__scentraPrisma = prisma
-const dbEnabled = Boolean(process.env.DATABASE_URL)
+let dbEnabled = Boolean(process.env.DATABASE_URL)
+const degradeToMemory = (error) => { if (!dbEnabled) return false; dbEnabled = false; console.error('Database unavailable - serving in-memory demo data:', error?.message || String(error)); return true }
 const deliveryDefaults = { enabled:true, freeOver:75000, lagos:4000, other:12000 }
 const memoryOrders = []
 const memoryCustomers = new Map()
@@ -53,8 +54,13 @@ async function listProducts(query = {}) {
   let products
   if (!dbEnabled) products = seedProducts
   else {
-    const records = await prisma.product.findMany({ include:{ category:true, variants:true }, orderBy:{ createdAt:'desc' } })
-    products = records.map((product) => ({ ...product, category:product.category.name, categorySlug:product.category.slug }))
+    try {
+      const records = await prisma.product.findMany({ include:{ category:true, variants:true }, orderBy:{ createdAt:'desc' } })
+      products = records.map((product) => ({ ...product, category:product.category.name, categorySlug:product.category.slug }))
+    } catch (error) {
+      degradeToMemory(error)
+      products = seedProducts
+    }
   }
   return products.filter((product) => {
     const text = `${product.name} ${product.brand || ''} ${product.category}`.toLowerCase()
@@ -101,8 +107,13 @@ async function releaseExpiredReservations() {
 
 async function getSetting(key) {
   if (!dbEnabled) return memorySettings[key] || {}
-  const setting = await prisma.siteSetting.findUnique({ where:{ key } })
-  return setting?.value || memorySettings[key] || {}
+  try {
+    const setting = await prisma.siteSetting.findUnique({ where:{ key } })
+    return setting?.value || memorySettings[key] || {}
+  } catch (error) {
+    degradeToMemory(error)
+    return memorySettings[key] || {}
+  }
 }
 
 async function deliveryFor(subtotal, discount, state) {
