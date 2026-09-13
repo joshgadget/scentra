@@ -58,3 +58,37 @@ npm run build
 ```
 
 The repository is configured for Vercel with the Vite output in `apps/web/dist` and the Express API exposed through `api/index.js`.
+
+## How ordering works
+
+Online card payment is not live yet, so checkout is built around WhatsApp:
+
+1. The customer fills in the checkout form and taps **Place order**.
+2. The order is saved to the store (it appears under Admin, Orders) and WhatsApp opens with the full order summary addressed to the owner's number.
+3. The team confirms stock, delivery and payment on WhatsApp.
+
+Set the destination number in either place:
+
+- Admin: Settings, Notification settings, Owner WhatsApp.
+- Server env: `OWNER_WHATSAPP` in `apps/api/.env` (fallback when nothing is saved in the admin).
+
+When you are ready to take card, transfer and USSD payments, add `PAYSTACK_SECRET_KEY`; checkout then shows the Paystack option instead of the "coming soon" notice.
+
+## Admin
+
+`/admin/login` (default `admin@scentra.co` / `admin`) opens the private workspace:
+
+- **Overview** and **Analytics**: revenue, order counts, pending orders, low stock.
+- **Products**: create, edit and delete fragrances, including the fragrance note family used for shop grouping, sizes, prices and stock.
+- **Orders**: review order details and move orders through Pending, Paid, Processing, Shipped, Delivered and Cancelled.
+- **Customers**, **Coupons**: customer list and promo codes.
+- **Settings**: homepage announcement, hero copy, order-notification email and WhatsApp number, and delivery fees.
+
+## Catalogue grouping
+
+The shop groups the catalogue by **brand** or by **fragrance note** (Floral, Woody, Amber & Oriental, Fresh, Gourmand and so on) using the "Group by" selector. Branded perfumes default to note grouping so shoppers can browse a house by the kind of scent they want. Each product's note family is editable in Admin, Products.
+
+## Pages
+
+- `/privacy` and `/terms` hold the policy pages.
+- Unknown URLs render a custom 404 page with search and shortcuts.

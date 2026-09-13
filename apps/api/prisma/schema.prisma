@@ -33,6 +33,7 @@ model Product {
   metaDescription String?
   brand       String?
   gender      String           @default("unisex")
+  note        String           @default("")
   scentNotes  Json?
   images      Json
   featured    Boolean          @default(false)

@@ -68,3 +68,40 @@
 .empty-orders{text-align:center;padding:3rem 1rem;color:var(--muted,#8a7361)}
 .empty-orders svg{display:block;margin:0 auto 1rem;color:#d8c7b2}
 .empty-orders .btn{margin-top:1rem}
+
+/* grouped catalogue */
+.product-group{margin-bottom:52px}
+.group-head{display:flex;align-items:baseline;justify-content:space-between;gap:14px;border-bottom:1px solid #eee;padding-bottom:12px;margin-bottom:26px}
+.group-head h2{font-family:Georgia,serif;font-size:26px;margin:0}
+.group-head span{font-size:12px;color:var(--slate)}
+/* fragrance family */
+.family-row{display:flex;align-items:center;gap:10px;margin:0 0 14px}
+.family-chip{border:1px solid var(--border);padding:4px 12px;font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--red)}
+.family-meta{font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--slate)}
+/* payment options */
+.payment-choice.active{border-color:var(--red);background:#fff8f7}
+.payment-choice.soon{border-style:dashed;border-color:var(--border);color:var(--slate)}
+.payment-choice.soon strong{color:var(--slate)}
+.soon-badge{background:var(--light);border:1px solid var(--border);color:var(--slate);font-size:10px;letter-spacing:.1em;text-transform:uppercase;padding:2px 8px}
+.success-note{font-size:12px;color:var(--slate)}
+/* 404 */
+.notfound{padding:90px 0 110px;text-align:center;max-width:760px}
+.notfound h1{font-family:Georgia,serif;font-weight:400}
+.notfound>p:not(.eyebrow){color:#555}
+.notfound-search{display:grid;grid-template-columns:auto 1fr auto;align-items:center;gap:10px;border:1px solid var(--border);padding:10px 14px;margin:28px auto 8px;max-width:560px}
+.notfound-search svg{width:18px;color:var(--slate)}
+.notfound-search input{border:0;outline:0;height:38px}
+.notfound-suggestions{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px;margin:22px 0}
+.notfound-suggestions a{display:grid;grid-template-columns:52px 1fr;align-items:center;gap:12px;border:1px solid var(--border);padding:8px;text-align:left}
+.notfound-suggestions img{height:52px}
+.notfound-suggestions span{display:flex;flex-direction:column}
+.notfound-suggestions small{color:var(--slate);font-size:11px}
+.notfound-actions{display:flex;flex-wrap:wrap;gap:12px;justify-content:center;margin-top:26px}
+/* policies */
+.policy-sections{margin:26px 0 8px;display:grid;gap:22px}
+.policy-sections h2{font-size:19px;font-family:Georgia,serif}
+.policy-sections ul{margin:0;padding-left:18px;color:#555}
+.policy-sections li{margin-bottom:6px;font-size:15px}
+.policy-updated{font-size:12px;color:var(--slate)}
+.editorial-actions{display:flex;gap:12px;flex-wrap:wrap;margin-top:6px}
+@media(max-width:599px){.notfound{padding:60px 0 70px}.notfound-search{grid-template-columns:auto 1fr}.notfound-search .btn{grid-column:1/-1}.group-head h2{font-size:22px}}
