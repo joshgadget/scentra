@@ -11,9 +11,13 @@ const port = process.env.PORT || 4000
 const appUrl = process.env.APP_URL || (process.env.VERCEL_URL ? 'https://' + process.env.VERCEL_URL : 'http://localhost:5173')
 const prisma = globalThis.__scentraPrisma || new PrismaClient()
 if (process.env.NODE_ENV !== 'production') globalThis.__scentraPrisma = prisma
-let dbEnabled = Boolean(process.env.DATABASE_URL)
-const degradeToMemory = (error) => { if (!dbEnabled) return false; dbEnabled = false; console.error('Database unavailable - serving in-memory demo data:', error?.message || String(error)); return true }
+const dbConfigured = Boolean(process.env.DATABASE_URL)
+let dbEnabled = dbConfigured
+let dbRetryAt = 0
+const degradeToMemory = (error) => { if (!dbEnabled) return false; dbEnabled = false; dbRetryAt = Date.now() + 60 * 1000; console.error('Database unavailable - serving in-memory demo data:', error?.message || String(error)); return true }
+const retryDatabase = () => { if (dbConfigured && !dbEnabled && Date.now() >= dbRetryAt) { dbEnabled = true; dbRetryAt = 0 } }
 const deliveryDefaults = { enabled:true, freeOver:75000, lagos:4000, other:12000 }
+const defaultSupportWhatsapp = '07041969346'
 const memoryOrders = []
 const memoryCustomers = new Map()
 const memoryCoupons = [{ id:'welcome', code:'WELCOME10', type:'percent', value:10, expiryDate:'2027-12-31T23:59:59.000Z', usageLimit:500, usedCount:0, active:true }]
@@ -21,12 +25,13 @@ const memorySubscribers = new Set()
 const memorySettings = {
   delivery:deliveryDefaults,
   content:{ announcement:'Complimentary Lagos delivery on orders over NGN 75,000', heroEyebrow:'The art of personal fragrance', heroTitle:'Leave a beautiful impression.' },
-  notifications:{ ownerEmail:process.env.OWNER_EMAIL || '', ownerWhatsapp:process.env.OWNER_WHATSAPP || '' }
+  notifications:{ ownerEmail:process.env.OWNER_EMAIL || '', ownerWhatsapp:process.env.OWNER_WHATSAPP || defaultSupportWhatsapp }
 }
 
 const allowedOrigins = new Set([appUrl, 'http://localhost:5173', 'http://127.0.0.1:5173'].filter(Boolean))
 app.use(cors({ origin:(origin, callback) => callback(null, !origin || allowedOrigins.has(origin)) }))
-app.use(express.json({ verify:(req, _res, buffer) => { req.rawBody = buffer } }))
+app.use(express.json({ limit:'6mb', verify:(req, _res, buffer) => { req.rawBody = buffer } }))
+app.use((_req, _res, next) => { retryDatabase(); next() })
 
 const imagePool = [
   'https://images.unsplash.com/photo-1594035910387-fea47794261f?auto=format&fit=crop&w=900&q=85',
@@ -47,7 +52,15 @@ const seedProducts = [
 ]
 
 const money = (amount) => `NGN ${new Intl.NumberFormat('en-NG').format(amount)}`
-const orderNumber = () => `SC-${new Date().getFullYear()}-${Math.random().toString(36).slice(2, 8).toUpperCase()}`
+const orderNumber = () => `SC-${new Date().getFullYear()}-${crypto.randomBytes(4).toString('hex').toUpperCase().slice(0, 6)}`
+async function uniqueOrderNumber() {
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    const candidate = orderNumber()
+    if (!dbEnabled) { if (!memoryOrders.some((order) => order.orderNumber === candidate)) return candidate; continue }
+    try { const existing = await prisma.order.findUnique({ where:{ orderNumber:candidate }, select:{ id:true } }); if (!existing) return candidate } catch { return candidate }
+  }
+  return `${orderNumber()}-${crypto.randomBytes(2).toString('hex').toUpperCase()}`
+}
 const slugify = (value) => value.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '')
 
 async function listProducts(query = {}) {
@@ -105,7 +118,7 @@ async function restoreReservation(order, tx = prisma) {
 async function releaseExpiredReservations() {
   if (!dbEnabled) return
   const expired = await prisma.order.findMany({ where:{ status:'PENDING', reservationExpiresAt:{ lte:new Date() } }, include:{ items:true } })
-  for (const order of expired) await prisma.$transaction(async (tx) => { await restoreReservation(order, tx); await tx.order.update({ where:{ id:order.id }, data:{ status:'CANCELLED', reservationExpiresAt:null } }) })
+  for (const order of expired) { await restoreReservation(order); await prisma.order.update({ where:{ id:order.id }, data:{ status:'CANCELLED', reservationExpiresAt:null } }) }
 }
 
 async function getSetting(key) {
@@ -134,25 +147,25 @@ async function calculateCoupon(code, subtotal) {
   return { discount, coupon }
 }
 
-async function notifyPaidOrder(order) {
+async function notifyOrder(order, paid = true) {
   const items = (order.items || []).map((item) => `${item.qty}x ${item.name} (${item.size})`).join('\n')
   const address = typeof order.shippingAddress === 'string' ? order.shippingAddress : Object.values(order.shippingAddress || {}).filter(Boolean).join(', ')
   const ownerText = `New Scentra order ${order.orderNumber}\n${order.customerName} - ${order.customerPhone || ''}\n${items}\nTotal: ${money(order.total)}\n${address}`
   const notifications = await getSetting('notifications')
   const ownerEmail = notifications.ownerEmail || process.env.OWNER_EMAIL
-  const ownerWhatsapp = notifications.ownerWhatsapp || process.env.OWNER_WHATSAPP
+  const ownerWhatsapp = notifications.ownerWhatsapp || process.env.OWNER_WHATSAPP || defaultSupportWhatsapp
   if (process.env.SMTP_HOST) {
     const { default:nodemailer } = await import('nodemailer')
     const transporter = nodemailer.createTransport({ host:process.env.SMTP_HOST, port:Number(process.env.SMTP_PORT || 587), secure:Number(process.env.SMTP_PORT) === 465, auth:{ user:process.env.SMTP_USER, pass:process.env.SMTP_PASS } })
-    if (ownerEmail) await transporter.sendMail({ from:process.env.SMTP_USER, to:ownerEmail, subject:`New paid order ${order.orderNumber}`, text:ownerText })
-    await transporter.sendMail({ from:process.env.SMTP_USER, to:order.customerEmail, subject:`Your Scentra order ${order.orderNumber} is confirmed`, text:`Hello ${order.customerName},\n\nThank you for your order. Your payment is confirmed and we are preparing your fragrance.\n\n${items}\nTotal: ${money(order.total)}\n\nWe will contact you when it is on the way.\n\nScentra` })
+    if (ownerEmail) await transporter.sendMail({ from:process.env.SMTP_USER, to:ownerEmail, subject:paid ? `New paid order ${order.orderNumber}` : `New order ${order.orderNumber} - awaiting confirmation`, text:ownerText })
+    if (paid) await transporter.sendMail({ from:process.env.SMTP_USER, to:order.customerEmail, subject:`Your Scentra order ${order.orderNumber} is confirmed`, text:`Hello ${order.customerName},\n\nThank you for your order. Your payment is confirmed and we are preparing your fragrance.\n\n${items}\nTotal: ${money(order.total)}\n\nWe will contact you when it is on the way.\n\nScentra` })
   }
   if (process.env.TWILIO_ACCOUNT_SID && ownerWhatsapp) {
     await fetch(`https://api.twilio.com/2010-04-01/Accounts/${process.env.TWILIO_ACCOUNT_SID}/Messages.json`, { method:'POST', headers:{ Authorization:`Basic ${Buffer.from(`${process.env.TWILIO_ACCOUNT_SID}:${process.env.TWILIO_AUTH_TOKEN}`).toString('base64')}`, 'Content-Type':'application/x-www-form-urlencoded' }, body:new URLSearchParams({ From:process.env.TWILIO_WHATSAPP_FROM, To:`whatsapp:${ownerWhatsapp}`, Body:ownerText }) })
   }
 }
 
-const safeNotify = (order) => notifyPaidOrder(order).catch((error) => console.error('Order notification failed:', error.message))
+const safeNotify = (order, paid = true) => notifyOrder(order, paid).catch((error) => console.error('Order notification failed:', error.message))
 const adminAuth = (req, res, next) => { try { const token = req.headers.authorization?.replace('Bearer ', ''); req.admin = jwt.verify(token, process.env.JWT_SECRET || 'dev-secret'); next() } catch { res.status(401).json({ error:'Unauthorized' }) } }
 const cachePublic = (res, seconds = 30) => res.set('Cache-Control', `public, max-age=0, s-maxage=${seconds}, stale-while-revalidate=${seconds * 10}`)
 const cachePrivate = (res) => res.set('Cache-Control', 'private, no-store')
@@ -275,7 +288,7 @@ async function getSummary() {
 app.get('/api/health', (_, res) => cachePrivate(res).json({ ok:true, database:dbEnabled ? 'postgresql' : 'memory', readyForLive:dbEnabled && Boolean(process.env.PAYSTACK_SECRET_KEY) && Boolean(process.env.JWT_SECRET) }))
 app.get('/api/config', async (_, res) => {
   const [delivery, notifications] = await Promise.all([getSetting('delivery'), getSetting('notifications')]).catch(() => [deliveryDefaults, {}])
-  cachePrivate(res).json({ paymentMode:process.env.PAYSTACK_SECRET_KEY ? 'live' : 'demo', paymentProvider:'Paystack', database:dbEnabled ? 'postgresql' : 'memory', accounts:{ provider:'supabase', ready:supabaseReady }, delivery:{ ...deliveryDefaults, ...delivery }, support:{ email:'hello@scentra.co', whatsapp:(notifications?.ownerWhatsapp) || process.env.OWNER_WHATSAPP || '' } })
+  cachePrivate(res).json({ paymentMode:process.env.PAYSTACK_SECRET_KEY ? 'live' : 'demo', paymentProvider:'Paystack', database:dbEnabled ? 'postgresql' : 'memory', accounts:{ provider:'supabase', ready:supabaseReady }, delivery:{ ...deliveryDefaults, ...delivery }, support:{ email:'hello@scentra.co', whatsapp:(notifications?.ownerWhatsapp) || process.env.OWNER_WHATSAPP || defaultSupportWhatsapp } })
 })
 app.get('/api/categories', (_, res) => cachePublic(res, 3600).json([
   { name:'Custom Perfumes', slug:'custom-perfumes', eyebrow:'Made by us', description:'Small-batch signatures blended in Lagos.' },
@@ -299,6 +312,13 @@ app.post('/api/newsletter', async (req, res) => {
 })
 app.post('/api/coupons/validate', async (req, res) => { try { const subtotal = Number(req.body.subtotal || 0); const result = await calculateCoupon(req.body.code, subtotal); res.json({ code:result.coupon.code, discount:result.discount, total:Math.max(0, subtotal-result.discount) }) } catch (error) { res.status(400).json({ error:error.message }) } })
 
+const resolveSeedLine = (item) => {
+  const product = seedProducts.find((entry) => entry.id === item.productId || entry.name === item.name)
+  if (!product) return null
+  const variant = product.variants.find((entry) => entry.id === item.variantId || entry.size === item.size)
+  return variant ? { product, variant } : null
+}
+
 const orderSchema = z.object({
   customer:z.object({ name:z.string().min(2), email:z.string().email(), phone:z.string().min(7) }),
   shippingAddress:z.object({ address:z.string().min(5), city:z.string().min(2), state:z.string().min(2), note:z.string().optional() }),
@@ -310,23 +330,38 @@ app.post('/api/orders', async (req, res) => {
   const parsed = orderSchema.safeParse(req.body)
   if (!parsed.success) return res.status(400).json({ error:'Please check your checkout details', details:parsed.error.flatten() })
   const body = parsed.data
-  const number = orderNumber()
+  const number = await uniqueOrderNumber()
   let order
   try {
     if (dbEnabled) {
       const variants = await prisma.productVariant.findMany({ where:{ id:{ in:body.items.map((item) => item.variantId) } }, include:{ product:true } })
-      const items = body.items.map((item) => { const variant = variants.find((entry) => entry.id === item.variantId); if (!variant || variant.stock < item.qty) throw new Error(`${item.name} is no longer available in that quantity`); return { variantId:variant.id, name:variant.product.name, size:variant.size, qty:item.qty, price:variant.price } })
+      const items = []
+      for (const item of body.items) {
+        let variant = variants.find((entry) => entry.id === item.variantId)
+        if (!variant) variant = await prisma.productVariant.findFirst({ where:{ size:item.size, product:{ name:item.name } }, include:{ product:true } })
+        if (!variant || variant.stock < item.qty) throw new Error(`${item.name} is no longer available in that quantity`)
+        items.push({ variantId:variant.id, name:variant.product.name, size:variant.size, qty:item.qty, price:variant.price })
+      }
       const subtotal = items.reduce((sum, item) => sum + item.price * item.qty, 0)
       const { discount, coupon } = await calculateCoupon(body.couponCode, subtotal)
       const deliveryFee = await deliveryFor(subtotal, discount, body.shippingAddress.state || '')
-      order = await prisma.$transaction(async (tx) => {
-        for (const item of items) { const result = await tx.productVariant.updateMany({ where:{ id:item.variantId, stock:{ gte:item.qty } }, data:{ stock:{ decrement:item.qty } } }); if (!result.count) throw new Error(`${item.name} just sold out`) }
-        const customer = await tx.customer.upsert({ where:{ email:body.customer.email }, update:{ name:body.customer.name, phone:body.customer.phone }, create:{ name:body.customer.name, email:body.customer.email, phone:body.customer.phone } })
-        if (coupon) await tx.coupon.update({ where:{ id:coupon.id }, data:{ usedCount:{ increment:1 } } })
-        return tx.order.create({ data:{ orderNumber:number, customerId:customer.id, customerName:body.customer.name, customerEmail:body.customer.email, customerPhone:body.customer.phone, shippingAddress:body.shippingAddress, subtotal, discount, deliveryFee, couponCode:coupon?.code, total:subtotal-discount+deliveryFee, reservationExpiresAt:new Date(Date.now() + 30 * 60 * 1000), items:{ create:items } }, include:{ items:true } })
-      })
+      const reserved = []
+      try {
+        for (const item of items) {
+          const result = await prisma.productVariant.updateMany({ where:{ id:item.variantId, stock:{ gte:item.qty } }, data:{ stock:{ decrement:item.qty } } })
+          if (!result.count) throw new Error(`${item.name} just sold out`)
+          reserved.push(item)
+        }
+        const customer = await prisma.customer.upsert({ where:{ email:body.customer.email }, update:{ name:body.customer.name, phone:body.customer.phone }, create:{ name:body.customer.name, email:body.customer.email, phone:body.customer.phone } })
+        if (coupon) await prisma.coupon.update({ where:{ id:coupon.id }, data:{ usedCount:{ increment:1 } } })
+        order = await prisma.order.create({ data:{ orderNumber:number, customerId:customer.id, customerName:body.customer.name, customerEmail:body.customer.email, customerPhone:body.customer.phone, shippingAddress:body.shippingAddress, subtotal, discount, deliveryFee, couponCode:coupon?.code, total:subtotal-discount+deliveryFee, reservationExpiresAt:process.env.PAYSTACK_SECRET_KEY ? new Date(Date.now() + 30 * 60 * 1000) : null, items:{ create:items } }, include:{ items:true } })
+      } catch (error) {
+        for (const done of reserved) await prisma.productVariant.update({ where:{ id:done.variantId }, data:{ stock:{ increment:done.qty } } }).catch(() => {})
+        if (coupon) await prisma.coupon.update({ where:{ id:coupon.id }, data:{ usedCount:{ decrement:1 } } }).catch(() => {})
+        throw error
+      }
     } else {
-      const items = body.items.map((item) => { const product = seedProducts.find((entry) => entry.id === item.productId); const variant = product?.variants.find((entry) => entry.id === item.variantId); if (!variant || variant.stock < item.qty) throw new Error(`${item.name} is no longer available in that quantity`); return { ...item, name:product.name, size:variant.size, price:variant.price } })
+      const items = body.items.map((item) => { const line = resolveSeedLine(item); if (!line || line.variant.stock < item.qty) throw new Error(`${item.name} is no longer available in that quantity`); return { ...item, productId:line.product.id, variantId:line.variant.id, name:line.product.name, size:line.variant.size, price:line.variant.price } })
       const subtotal = items.reduce((sum, item) => sum + item.price * item.qty, 0)
       const { discount, coupon } = await calculateCoupon(body.couponCode, subtotal)
       const deliveryFee = await deliveryFor(subtotal, discount, body.shippingAddress.state || '')
@@ -341,18 +376,21 @@ app.post('/api/orders', async (req, res) => {
     }
 
     if (!process.env.PAYSTACK_SECRET_KEY) {
-      if (dbEnabled) order = await prisma.order.update({ where:{ id:order.id }, data:{ status:'PAID', reservationExpiresAt:null }, include:{ items:true } })
-      else order.status = 'PAID'
-      safeNotify(order)
-      return res.status(201).json({ orderNumber:number, total:order.total, deliveryFee:order.deliveryFee, authorization_url:null, demo:true })
+      safeNotify(order, false)
+      return res.status(201).json({ orderNumber:number, status:order.status || 'PENDING', total:order.total, deliveryFee:order.deliveryFee, authorization_url:null, demo:true })
     }
 
     const response = await fetch('https://api.paystack.co/transaction/initialize', { method:'POST', headers:{ Authorization:`Bearer ${process.env.PAYSTACK_SECRET_KEY}`, 'Content-Type':'application/json' }, body:JSON.stringify({ email:body.customer.email, amount:order.total * 100, reference:number, callback_url:`${appUrl}/checkout/success` }) })
     const payment = await response.json()
     if (!response.ok || !payment.data?.authorization_url) throw new Error(payment.message || 'Payment could not be initialized')
-    res.status(201).json({ orderNumber:number, total:order.total, deliveryFee:order.deliveryFee, authorization_url:payment.data.authorization_url, demo:false })
+    res.status(201).json({ orderNumber:number, status:order.status || 'PENDING', total:order.total, deliveryFee:order.deliveryFee, authorization_url:payment.data.authorization_url, demo:false })
   } catch (error) {
-    if (dbEnabled && order?.id) await prisma.$transaction(async (tx) => { const current = await tx.order.findUnique({ where:{ id:order.id }, include:{ items:true } }); if (current) { await restoreReservation(current, tx); await tx.order.update({ where:{ id:order.id }, data:{ status:'CANCELLED', reservationExpiresAt:null } }) } }).catch(() => {})
+    if (dbEnabled && order?.id) { try { const current = await prisma.order.findUnique({ where:{ id:order.id }, include:{ items:true } }); if (current) { await restoreReservation(current); await prisma.order.update({ where:{ id:order.id }, data:{ status:'CANCELLED', reservationExpiresAt:null } }) } } catch (cleanupError) { console.error('Order cleanup failed:', cleanupError.message) } }
+    const failure = String(error?.message || '')
+    if (/Can't reach database server|PrismaClientInitializationError|P1001|Server has closed the connection|Connection terminated|Timed out fetching a new connection/i.test(failure)) {
+      console.error('Order creation failed - database unreachable:', failure.slice(0, 200))
+      return res.status(503).json({ error:'Our order system is briefly unavailable. Please try again in a moment, or send your order to us on WhatsApp.' })
+    }
     if (!dbEnabled && order) { const index=memoryOrders.findIndex((item)=>item.id===order.id); if(index>=0)memoryOrders.splice(index,1); for(const item of order.items||[]){const product=seedProducts.find((entry)=>entry.id===item.productId);const variant=product?.variants.find((entry)=>entry.id===item.variantId);if(variant)variant.stock+=item.qty} if(order.couponCode){const coupon=memoryCoupons.find((item)=>item.code===order.couponCode);if(coupon&&coupon.usedCount>0)coupon.usedCount-=1} }
     res.status(409).json({ error:error.message || 'Unable to create order' })
   }
@@ -370,19 +408,27 @@ app.post('/api/payments/paystack/webhook', async (req, res) => {
   try {
     if (dbEnabled) {
       const current = await prisma.order.findUnique({ where:{ orderNumber:reference }, include:{ items:true } })
-      if (current && current.status === 'PENDING') { const order = await prisma.order.update({ where:{ id:current.id }, data:{ status:'PAID', paymentReference:reference, reservationExpiresAt:null }, include:{ items:true } }); safeNotify(order) }
+      if (current && current.status === 'PENDING') { const order = await prisma.order.update({ where:{ id:current.id }, data:{ status:'PAID', paymentReference:reference, reservationExpiresAt:null }, include:{ items:true } }); safeNotify(order, true) }
     } else {
       const order = memoryOrders.find((item) => item.orderNumber === reference)
-      if (order && order.status === 'PENDING') { order.status = 'PAID'; order.paymentReference = reference; safeNotify(order) }
+      if (order && order.status === 'PENDING') { order.status = 'PAID'; order.paymentReference = reference; safeNotify(order, true) }
     }
   } catch (error) { console.error('Webhook handling failed:', error.message) }
   res.sendStatus(200)
 })
 
 app.get('/api/orders/:reference/status', async (req, res) => {
-  const raw = dbEnabled ? await prisma.order.findUnique({ where:{ orderNumber:req.params.reference }, select:{ orderNumber:true, status:true, total:true, deliveryFee:true, createdAt:true } }) : memoryOrders.find((item) => item.orderNumber === req.params.reference)
-  const order = raw ? { orderNumber:raw.orderNumber, status:raw.status, total:raw.total, deliveryFee:raw.deliveryFee, createdAt:raw.createdAt } : null
-  order ? res.json(order) : res.status(404).json({ error:'Order not found' })
+  const reference = String(req.params.reference || '').trim()
+  try {
+    const raw = dbEnabled
+      ? await prisma.order.findFirst({ where:{ orderNumber:{ equals:reference, mode:'insensitive' } }, include:{ items:{ select:{ name:true, size:true, qty:true, price:true } } } })
+      : memoryOrders.find((item) => String(item.orderNumber).toLowerCase() === reference.toLowerCase())
+    if (!raw) return res.status(404).json({ error:'Order not found' })
+    res.json({ orderNumber:raw.orderNumber, status:raw.status, total:raw.total, deliveryFee:raw.deliveryFee || 0, createdAt:raw.createdAt, items:(raw.items || []).map(({ name, size, qty, price }) => ({ name, size, qty, price })) })
+  } catch (error) {
+    console.error('Order lookup failed:', error.message)
+    res.status(500).json({ error:'We could not look up that order right now. Please try again in a moment.' })
+  }
 })
 
 app.post('/api/admin/login', async (req, res) => {
@@ -390,8 +436,10 @@ app.post('/api/admin/login', async (req, res) => {
   let valid = false
   let name = 'Scentra Admin'
   const { default:bcrypt } = await import('bcryptjs')
-  if (dbEnabled) { const admin = await prisma.admin.findUnique({ where:{ email } }); valid = Boolean(admin && await bcrypt.compare(password, admin.password)); name = admin?.name || name }
-  else { const expectedEmail = process.env.ADMIN_EMAIL || 'admin@scentra.co'; const passwordHash = process.env.ADMIN_PASSWORD_HASH || bcrypt.hashSync(process.env.ADMIN_PASSWORD || 'Scentra123!', 10); valid = email === expectedEmail && await bcrypt.compare(password, passwordHash) }
+  let dbAdmin = null
+  if (dbEnabled) { try { dbAdmin = await prisma.admin.findUnique({ where:{ email } }) } catch (error) { degradeToMemory(error) } }
+  if (dbAdmin) { valid = await bcrypt.compare(password, dbAdmin.password); name = dbAdmin.name || name }
+  else { const expectedEmail = process.env.ADMIN_EMAIL || 'admin@scentra.co'; const passwordHash = process.env.ADMIN_PASSWORD_HASH || bcrypt.hashSync(process.env.ADMIN_PASSWORD || 'Scentra123!', 10); valid = String(email || '').toLowerCase() === expectedEmail.toLowerCase() && await bcrypt.compare(password, passwordHash) }
   if (!valid) return res.status(401).json({ error:'Invalid credentials' })
   res.json({ token:jwt.sign({ email, role:'admin' }, process.env.JWT_SECRET || 'dev-secret', { expiresIn:'2d' }), admin:{ email, name } })
 })
@@ -401,7 +449,7 @@ app.patch('/api/admin/orders/:id', adminAuth, async (req, res) => {
   if (!dbEnabled) { const order = memoryOrders.find((item) => item.id === req.params.id); if (order) order.status = req.body.status; return res.json(order || { ok:true }) }
   const current = await prisma.order.findUnique({ where:{ id:req.params.id }, include:{ items:true } })
   if (!current) return res.status(404).json({ error:'Order not found' })
-  if (req.body.status === 'CANCELLED' && current.status === 'PENDING') await prisma.$transaction(async (tx) => { await restoreReservation(current, tx); await tx.order.update({ where:{ id:current.id }, data:{ status:'CANCELLED', reservationExpiresAt:null } }) })
+  if (req.body.status === 'CANCELLED' && current.status === 'PENDING') await (async () => { await restoreReservation(current); await prisma.order.update({ where:{ id:current.id }, data:{ status:'CANCELLED', reservationExpiresAt:null } }) })()
   else await prisma.order.update({ where:{ id:current.id }, data:{ status:req.body.status, reservationExpiresAt:req.body.status === 'PAID' ? null : undefined } })
   res.json(await prisma.order.findUnique({ where:{ id:current.id } }))
 })
@@ -417,7 +465,7 @@ app.post('/api/admin/products', adminAuth, async (req, res) => {
   const product = await prisma.product.create({ data:{ name:body.name, slug:body.slug || slugify(body.name), description:body.description || '', metaDescription:body.metaDescription || '', brand:body.brand || 'SCENTRA', gender:body.gender || 'unisex', note:body.note || '', images, scentNotes:body.scentNotes || {}, categoryId:category.id, featured:Boolean(body.featured), onSale:Boolean(body.onSale), variants:{ create:variants.map(({size,price,stock})=>({size,price,stock})) } }, include:{ category:true, variants:true } })
   res.status(201).json({ ...product, category:product.category.name, categorySlug:product.category.slug })
 })
-app.patch('/api/admin/products/:id', adminAuth, async (req, res) => { const body=req.body; if (!dbEnabled) { const product=seedProducts.find((item)=>item.id===req.params.id); if(!product)return res.status(404).json({error:'Product not found'}); Object.assign(product,{name:body.name??product.name,slug:body.slug??product.slug,description:body.description??product.description,metaDescription:body.metaDescription??product.metaDescription,brand:body.brand??product.brand,gender:body.gender??product.gender,note:body.note??product.note,images:body.images?.length?body.images:product.images,featured:body.featured??product.featured,onSale:body.onSale??product.onSale}); if(body.variants)product.variants=body.variants.map((variant,index)=>({...variant,id:variant.id||`variant-${Date.now()}-${index}`,price:Number(variant.price),stock:Number(variant.stock)})); return res.json(product) } const data={}; for(const key of ['name','slug','description','metaDescription','brand','gender','note','featured','onSale'])if(body[key]!==undefined)data[key]=body[key];if(body.images?.length)data.images=body.images; await prisma.product.update({where:{id:req.params.id},data}); if(body.variants)for(const variant of body.variants){if(variant.id)await prisma.productVariant.update({where:{id:variant.id},data:{size:variant.size,price:Number(variant.price),stock:Number(variant.stock)}});else await prisma.productVariant.create({data:{productId:req.params.id,size:variant.size,price:Number(variant.price),stock:Number(variant.stock)}})} const product=await prisma.product.findUnique({where:{id:req.params.id},include:{category:true,variants:true}});res.json({...product,category:product.category.name,categorySlug:product.category.slug}) })
+app.patch('/api/admin/products/:id', adminAuth, async (req, res) => { const body=req.body; if (!dbEnabled) { const product=seedProducts.find((item)=>item.id===req.params.id); if(!product)return res.status(404).json({error:'Product not found'}); Object.assign(product,{name:body.name??product.name,slug:body.slug??product.slug,description:body.description??product.description,metaDescription:body.metaDescription??product.metaDescription,brand:body.brand??product.brand,gender:body.gender??product.gender,note:body.note??product.note,images:Array.isArray(body.images)?body.images:product.images,featured:body.featured??product.featured,onSale:body.onSale??product.onSale}); if(body.variants)product.variants=body.variants.map((variant,index)=>({...variant,id:variant.id||`variant-${Date.now()}-${index}`,price:Number(variant.price),stock:Number(variant.stock)})); return res.json(product) } const data={}; for(const key of ['name','slug','description','metaDescription','brand','gender','note','featured','onSale'])if(body[key]!==undefined)data[key]=body[key];if(Array.isArray(body.images))data.images=body.images; await prisma.product.update({where:{id:req.params.id},data}); if(body.variants)for(const variant of body.variants){if(variant.id)await prisma.productVariant.update({where:{id:variant.id},data:{size:variant.size,price:Number(variant.price),stock:Number(variant.stock)}});else await prisma.productVariant.create({data:{productId:req.params.id,size:variant.size,price:Number(variant.price),stock:Number(variant.stock)}})} const product=await prisma.product.findUnique({where:{id:req.params.id},include:{category:true,variants:true}});res.json({...product,category:product.category.name,categorySlug:product.category.slug}) })
 app.delete('/api/admin/products/:id', adminAuth, async (req, res) => { if (!dbEnabled) { const index = seedProducts.findIndex((item) => item.id === req.params.id); if (index >= 0) seedProducts.splice(index, 1); return res.sendStatus(204) } await prisma.product.delete({ where:{ id:req.params.id } }); res.sendStatus(204) })
 app.get('/api/admin/customers', adminAuth, async (_, res) => cachePrivate(res).json(await listCustomers()))
 app.get('/api/admin/coupons', adminAuth, async (_, res) => res.json(dbEnabled ? await prisma.coupon.findMany({ orderBy:{ expiryDate:'desc' } }) : memoryCoupons))
@@ -427,17 +475,71 @@ app.get('/api/admin/settings', adminAuth, async (_, res) => res.json({ content:a
 app.put('/api/admin/settings/:key', adminAuth, async (req, res) => { if (!['content','notifications','delivery'].includes(req.params.key)) return res.status(400).json({ error:'Unknown settings group' }); if (!dbEnabled) { memorySettings[req.params.key]={...memorySettings[req.params.key],...req.body}; return res.json(memorySettings[req.params.key]) } const setting=await prisma.siteSetting.upsert({ where:{ key:req.params.key }, update:{ value:req.body }, create:{ key:req.params.key, value:req.body } }); res.json(setting.value) })
 app.get('/api/admin/summary', adminAuth, async (_, res) => cachePrivate(res).json(await getSummary()))
 app.get('/api/admin/dashboard', adminAuth, async (_, res) => {
-  const [summary, orders, customers, coupons, settings] = await Promise.all([
-    getSummary(),
-    dbEnabled ? prisma.order.findMany({ include:{ items:true }, orderBy:{ createdAt:'desc' } }) : memoryOrders,
-    listCustomers(),
-    dbEnabled ? prisma.coupon.findMany({ orderBy:{ expiryDate:'desc' } }) : memoryCoupons,
-    Promise.all([getSetting('content'), getSetting('notifications'), getSetting('delivery')]).then(([content, notifications, delivery]) => ({ content, notifications, delivery }))
-  ])
-  cachePrivate(res).json({ summary, orders, customers, coupons, settings })
+  const load = async () => {
+    const [summary, orders, customers, coupons, settings] = await Promise.all([
+      getSummary(),
+      dbEnabled ? prisma.order.findMany({ include:{ items:true }, orderBy:{ createdAt:'desc' } }) : memoryOrders,
+      listCustomers(),
+      dbEnabled ? prisma.coupon.findMany({ orderBy:{ expiryDate:'desc' } }) : memoryCoupons,
+      Promise.all([getSetting('content'), getSetting('notifications'), getSetting('delivery')]).then(([content, notifications, delivery]) => ({ content, notifications, delivery }))
+    ])
+    return { summary, orders, customers, coupons, settings }
+  }
+  try {
+    cachePrivate(res).json(await load())
+  } catch (error) {
+    degradeToMemory(error)
+    try { cachePrivate(res).json(await load()) }
+    catch { res.status(503).json({ error:'Store data is briefly unavailable. Please try again in a moment.' }) }
+  }
 })
 
+
+const uploadBucket = process.env.SUPABASE_UPLOAD_BUCKET || 'product-images'
+const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY || ''
+const storageReady = Boolean(supabaseUrl && supabaseServiceKey)
+const imageExtensions = { 'image/png':'png', 'image/jpeg':'jpg', 'image/jpg':'jpg', 'image/webp':'webp', 'image/gif':'gif', 'image/avif':'avif' }
+let uploadBucketReady = false
+
+async function ensureUploadBucket() {
+  if (uploadBucketReady) return
+  const response = await fetch(`${supabaseUrl}/storage/v1/bucket`, { method:'POST', headers:supabaseAuthHeaders(supabaseServiceKey), body:JSON.stringify({ id:uploadBucket, name:uploadBucket, public:true }) })
+  if (!response.ok) {
+    const body = await response.text().catch(() => '')
+    if (!/already exists|duplicate|resource already/i.test(body)) throw new Error('Image storage is unavailable')
+  }
+  uploadBucketReady = true
+}
+
+app.post('/api/admin/uploads', adminAuth, async (req, res) => {
+  try {
+    const dataUrl = String(req.body?.dataUrl || '').trim()
+    const match = /^data:(image\/[a-z0-9.+-]+);base64,([a-z0-9+/=\s]+)$/i.exec(dataUrl)
+    if (!match) return res.status(400).json({ error:'Choose a PNG, JPG, WebP, GIF or AVIF image' })
+    const contentType = match[1].toLowerCase()
+    const extension = imageExtensions[contentType]
+    if (!extension) return res.status(400).json({ error:'Only PNG, JPG, WebP, GIF or AVIF images are supported' })
+    const buffer = Buffer.from(match[2].replace(/\s+/g, ''), 'base64')
+    if (!buffer.length) return res.status(400).json({ error:'That file looks empty. Please choose another image.' })
+    if (buffer.length > 5 * 1024 * 1024) return res.status(413).json({ error:'Images must be smaller than 5MB' })
+    if (!storageReady) return res.status(201).json({ url:dataUrl, storage:'inline' })
+    await ensureUploadBucket()
+    const filename = `${slugify(String(req.body?.filename || 'product-image')).slice(0, 48) || 'product-image'}-${Date.now().toString(36)}-${crypto.randomBytes(3).toString('hex')}.${extension}`
+    const upload = await fetch(`${supabaseUrl}/storage/v1/object/${uploadBucket}/${filename}`, { method:'POST', headers:{ ...supabaseAuthHeaders(supabaseServiceKey), 'Content-Type':contentType, 'x-upsert':'true' }, body:buffer })
+    if (!upload.ok) { console.error('Image upload failed:', (await upload.text().catch(() => '')).slice(0, 200)); return res.status(502).json({ error:'Could not store that image. Please try again.' }) }
+    res.status(201).json({ url:`${supabaseUrl}/storage/v1/object/public/${uploadBucket}/${filename}`, storage:'supabase' })
+  } catch (error) {
+    console.error('Image upload error:', error.message)
+    res.status(500).json({ error:error.message || 'Could not upload that image' })
+  }
+})
 app.use('/api', (_, res) => res.status(404).json({ error:'Not found' }))
+app.use((error, _req, res, _next) => {
+  console.error('Unhandled API error:', error?.message || error)
+  if (res.headersSent) return
+  if (error?.type === 'entity.too.large' || error?.status === 413) return res.status(413).json({ error:'That upload is too large. Please use an image under 6MB.' })
+  res.status(error?.status || 500).json({ error:'Something went wrong on our side. Please try again.' })
+})
 
 export const ready = ensureSeed().catch((error) => console.error('Database setup failed:', error.message))
 
