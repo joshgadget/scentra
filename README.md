@@ -92,3 +92,27 @@ The shop groups the catalogue by **brand** or by **fragrance note** (Floral, Woo
 
 - `/privacy` and `/terms` hold the policy pages.
 - Unknown URLs render a custom 404 page with search and shortcuts.
+
+## Admin data, demo mode and the local demo store
+
+The API always tells you which data source the admin is using: `GET /api/health` returns
+`database: "postgresql"` when PostgreSQL is reachable and `database: "demo"` when the API is
+serving the local demo store. The admin header shows the same thing as a banner.
+
+- **PostgreSQL connected** - everything (products, orders, customers, coupons, settings) is read
+  from and written to the database.
+- **PostgreSQL not connected** - the API serves the local demo store instead of pretending a write
+  succeeded. The demo store is a plain JSON file, `apps/api/.data/demo-store.json` by default
+  (override with `SCENTRA_DEMO_STORE`, or `/tmp/scentra-demo-store/demo-store.json` when the app
+  directory is read-only). Admin changes are saved there so they survive page refreshes **and**
+  API restarts.
+
+A process that has fallen back to the demo store never switches back to PostgreSQL while it is
+running, because doing so would silently drop demo-store edits. To go back to the database:
+
+1. Fix the connection (check `DATABASE_URL` in the hosting environment variables).
+2. Delete `apps/api/.data/demo-store.json` if it holds demo changes you do not need.
+3. Restart the API.
+
+Storefront content (`/api/storefront`, `/api/products`, `/api/content`) is sent `no-store` so admin
+edits appear immediately instead of being served from a stale CDN copy.

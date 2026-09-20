@@ -74,7 +74,17 @@ const degradeToMemory = (error) => {
   // direct connection once before falling back to the local demo store.
   if (!isConfigFailure(error) && connectionFallback && !connectionFallbackUsed) {
     connectionFallbackUsed = true
-    try { prisma = new PrismaClient({ datasourceUrl:connectionFallback }); dbRetryAt = 0; console.warn('The pooled database endpoint could not be reached - switched to the direct connection'); return false }
+    try {
+      // Stay degraded until a real query proves the direct endpoint works, so nothing claims to be
+      // connected when it is not.
+      prisma = new PrismaClient({ datasourceUrl:connectionFallback })
+      dbEnabled = false
+      databaseRecoveryReady = false
+      dbRetryAt = 0
+      databaseProblem = 'The pooled database connection failed - checking the direct connection.'
+      console.warn('The pooled database endpoint could not be reached - checking the direct connection')
+      return true
+    }
     catch (fallbackError) { console.error('Direct database connection failed:', fallbackError.message) }
   }
   dbEnabled = false
@@ -165,6 +175,7 @@ const demoStorePath = (() => {
   return ''
 })()
 let demoMutationCount = 0
+let demoSavedAt = null
 let demoWriteTimer = null
 const persistDemoStore = () => {
   if (!demoStorePath) { fallbackChanged = true; demoMutationCount += 1; return }
@@ -173,13 +184,13 @@ const persistDemoStore = () => {
   if (demoWriteTimer) return
   demoWriteTimer = setTimeout(() => {
     demoWriteTimer = null
-    try { fs.writeFileSync(demoStorePath, JSON.stringify({ savedAt:new Date().toISOString(), mutations:demoMutationCount, products:seedProducts, settings:memorySettings, coupons:memoryCoupons, orders:memoryOrders, customers:[...memoryCustomers.values()], subscribers:[...memorySubscribers] }, null, 2)) }
+    try { demoSavedAt = new Date().toISOString(); fs.writeFileSync(demoStorePath, JSON.stringify({ savedAt:demoSavedAt, mutations:demoMutationCount, products:seedProducts, settings:memorySettings, coupons:memoryCoupons, orders:memoryOrders, customers:[...memoryCustomers.values()], subscribers:[...memorySubscribers] }, null, 2)) }
     catch (error) { console.error('Could not save the local demo store:', error.message) }
   }, 200)
   demoWriteTimer.unref?.()
 }
 const savedDemoStore = (() => { if (!demoStorePath) return null; try { return JSON.parse(fs.readFileSync(demoStorePath, 'utf8')) } catch { return null } })()
-const storeStatus = () => ({ database:dbEnabled ? 'postgresql' : 'demo', databaseConfigured:dbConfigured, databaseUrlSource:databaseUrlSource || null, databaseUrlRepaired, problem:databaseProblem || undefined, demoStore:{ path:demoStorePath || null, localChanges:fallbackChanged, mutations:demoMutationCount, savedAt:savedDemoStore?.savedAt || null } })
+const storeStatus = () => ({ database:dbEnabled ? 'postgresql' : 'demo', databaseConfigured:dbConfigured, databaseUrlSource:databaseUrlSource || null, databaseUrlRepaired, problem:databaseProblem || undefined, demoStore:{ path:demoStorePath || null, localChanges:fallbackChanged, mutations:demoMutationCount, savedAt:demoSavedAt || null } })
 if (savedDemoStore) {
   try {
     if (Array.isArray(savedDemoStore.products) && savedDemoStore.products.length) seedProducts.splice(0, seedProducts.length, ...savedDemoStore.products)
@@ -189,6 +200,7 @@ if (savedDemoStore) {
     if (Array.isArray(savedDemoStore.customers)) for (const customer of savedDemoStore.customers) if (customer?.email) memoryCustomers.set(customer.email, customer)
     if (Array.isArray(savedDemoStore.subscribers)) for (const email of savedDemoStore.subscribers) memorySubscribers.add(email)
     demoMutationCount = Number(savedDemoStore.mutations || 0)
+    demoSavedAt = savedDemoStore.savedAt || null
     fallbackChanged = demoMutationCount > 0
     console.warn('Loaded ' + demoMutationCount + ' saved demo change(s) from ' + demoStorePath)
   } catch (error) { console.error('Could not read the local demo store:', error.message) }
@@ -293,7 +305,8 @@ async function calculateCoupon(code, subtotal) {
 async function notifyOrder(order, paid = true) {
   const items = (order.items || []).map((item) => `${item.qty}x ${item.name} (${item.size})`).join('\n')
   const address = typeof order.shippingAddress === 'string' ? order.shippingAddress : Object.values(order.shippingAddress || {}).filter(Boolean).join(', ')
-  const ownerText = `New Scentra order ${order.orderNumber}\n${order.customerName} - ${order.customerPhone || ''}\n${items}\nTotal: ${money(order.total)}\n${address}`
+  const paymentNote = paid ? `Payment: confirmed - ${money(order.total)}` : `Payment: bank transfer - reply with the account details to make payment to`
+  const ownerText = `New Scentra order ${order.orderNumber}\n${order.customerName} - ${order.customerPhone || ''}\n${items}\nTotal: ${money(order.total)}\n${address}\n\n${paymentNote}`
   const notifications = await getSetting('notifications')
   const ownerEmail = notifications.ownerEmail || process.env.OWNER_EMAIL
   const ownerWhatsapp = notifications.ownerWhatsapp || process.env.OWNER_WHATSAPP || defaultSupportWhatsapp
@@ -695,7 +708,7 @@ app.use((error, _req, res, _next) => {
   res.status(error?.status || 500).json({ error:'Something went wrong on our side. Please try again.' })
 })
 
-export const ready = ensureSeed().catch((error) => console.error('Database setup failed:', error.message))
+export const ready = ensureSeed().catch((error) => { degradeToMemory(error); console.error('Database setup failed:', error.message) })
 
 if (!process.env.VERCEL) {
   setInterval(() => releaseExpiredReservations().catch((error) => console.error('Reservation cleanup failed:', error.message)), 5 * 60 * 1000).unref()
