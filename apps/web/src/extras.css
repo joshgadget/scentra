@@ -92,6 +92,7 @@
 /* 404 */
 .notfound{padding:90px 0 110px;text-align:center;max-width:760px}
 .notfound h1{font-family:Georgia,serif;font-weight:400}
+.notfound-lead{max-width:570px;margin:0 auto}
 .notfound>p:not(.eyebrow){color:#555}
 .notfound-search{display:grid;grid-template-columns:auto 1fr auto;align-items:center;gap:10px;border:1px solid var(--border);padding:10px 14px;margin:28px auto 8px;max-width:560px}
 .notfound-search svg{width:18px;color:var(--slate)}
@@ -102,6 +103,13 @@
 .notfound-suggestions span{display:flex;flex-direction:column}
 .notfound-suggestions small{color:var(--slate);font-size:11px}
 .notfound-actions{display:flex;flex-wrap:wrap;gap:12px;justify-content:center;margin-top:26px}
+.notfound>p.notfound-support{margin:26px 0 0;font-size:14px;color:var(--slate)}
+.notfound-support a{border-bottom:1px solid var(--border);transition:color .2s,border-color .2s}
+.notfound-support a:hover{color:var(--red);border-color:var(--red)}
+.notfound-links{display:flex;flex-wrap:wrap;align-items:center;justify-content:center;gap:10px 24px;margin-top:44px;padding-top:24px;border-top:1px solid var(--border);font-size:14px}
+.notfound-links span{font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:var(--slate)}
+.notfound-links a{border-bottom:1px solid transparent;transition:color .2s,border-color .2s}
+.notfound-links a:hover{color:var(--red);border-color:var(--red)}
 /* policies */
 .policy-sections{margin:26px 0 8px;display:grid;gap:22px}
 .policy-sections h2{font-size:19px;font-family:Georgia,serif}

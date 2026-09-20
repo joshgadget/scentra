@@ -3,6 +3,8 @@ import { faqGroups } from './faq-data.js'
 
 const DEFAULT_IMAGE = 'https://images.unsplash.com/photo-1595425970377-c9703cf48b6d?auto=format&fit=crop&w=1200&q=80'
 
+const knownSections = ['admin', 'product', 'shop', 'cart', 'checkout', 'track', 'account']
+
 const editorialTitles = {
   about: ['Our story', 'The story behind Scentra, our Lagos fragrance studio, and the rituals we build around scent.'],
   contact: ['Contact us', 'Reach Scentra by phone, WhatsApp, or email. We are in Lagos and deliver across Nigeria.'],
@@ -51,6 +53,7 @@ export function applyMeta(pathname, products = [], content = {}) {
   let description = ''
   let image = DEFAULT_IMAGE
   let jsonLd = null
+  let noindex = false
 
   if (pathname.startsWith('/admin')) {
     title = 'Admin · Scentra'
@@ -119,6 +122,10 @@ export function applyMeta(pathname, products = [], content = {}) {
     if (copy) {
       title = copy[0] + ' · Scentra'
       description = copy[1]
+    } else if (!knownSections.includes(type)) {
+      title = 'Page not found · Scentra'
+      description = 'The page you were looking for is not here. It may have moved, or the link may be mistyped.'
+      noindex = true
     }
   }
 
@@ -138,6 +145,9 @@ export function applyMeta(pathname, products = [], content = {}) {
   setMeta('name', 'twitter:image', image)
   setCanonical(url)
   setJsonLd(jsonLd)
+  const robotsTag = document.head.querySelector('meta[name="robots"]')
+  if (noindex) setMeta('name', 'robots', 'noindex, follow')
+  else if (robotsTag) robotsTag.remove()
 
   trackPage(pathname)
   if (pathname === '/checkout/success') {
