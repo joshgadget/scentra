@@ -8,3 +8,6 @@ dist
 
 .vercel
 .env*
+
+# Local demo store used when PostgreSQL is not reachable
+apps/api/.data/

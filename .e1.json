@@ -1,0 +1,3 @@
+[
+ { "find": "import crypto from 'node:crypto'\nimport express from 'express'", "replace": "import crypto from 'node:crypto'\nimport fs from 'node:fs'\nimport os from 'node:os'\nimport path from 'node:path'\nimport express from 'express'" }
+]

@@ -1,5 +1,9 @@
 import 'dotenv/config'
 import crypto from 'node:crypto'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 import express from 'express'
 import cors from 'cors'
 import jwt from 'jsonwebtoken'
@@ -9,13 +13,99 @@ import { PrismaClient } from '@prisma/client'
 const app = express()
 const port = process.env.PORT || 4000
 const appUrl = process.env.APP_URL || (process.env.VERCEL_URL ? 'https://' + process.env.VERCEL_URL : 'http://localhost:5173')
-const prisma = globalThis.__scentraPrisma || new PrismaClient()
-if (process.env.NODE_ENV !== 'production') globalThis.__scentraPrisma = prisma
-const dbConfigured = Boolean(process.env.DATABASE_URL)
+// Connection strings pasted into a hosting dashboard can arrive wrapped in quotes or padded
+// with whitespace, which makes Prisma reject them even though the database is healthy.
+// Clean the value up first and fall back to any sibling variable the host provides.
+const connectionVars = ['DATABASE_URL', 'POSTGRES_PRISMA_URL', 'POSTGRES_URL', 'NEON_DATABASE_URL', 'DATABASE_URL_UNPOOLED', 'POSTGRES_URL_NON_POOLING']
+const readConnectionString = (value) => {
+  if (typeof value !== 'string') return ''
+  let cleaned = value.replace(/^\uFEFF/, '').trim()
+  while (cleaned.length > 1 && ((cleaned.startsWith('"') && cleaned.endsWith('"')) || (cleaned.startsWith("'") && cleaned.endsWith("'")))) cleaned = cleaned.slice(1, -1).trim()
+  return /^postgres(ql)?:\/\//i.test(cleaned) ? cleaned : ''
+}
+let databaseUrlRepaired = false
+const resolveConnectionString = () => {
+  for (const key of connectionVars) {
+    const raw = process.env[key]
+    if (!raw || !raw.trim()) continue
+    const cleaned = readConnectionString(raw)
+    if (!cleaned) { console.error(key + ' is not a valid PostgreSQL URL, so it was ignored. Check for stray quotes or spaces in that environment variable.'); continue }
+    if (cleaned !== raw) { databaseUrlRepaired = true; console.warn(key + ' had surrounding quotes or whitespace - using the cleaned value') }
+    return { key, url:cleaned }
+  }
+  return { key:'', url:'' }
+}
+const resolvedConnection = resolveConnectionString()
+const databaseUrl = resolvedConnection.url
+const databaseUrlSource = resolvedConnection.key
+const directConnectionUrl = readConnectionString(process.env.DATABASE_URL_UNPOOLED) || readConnectionString(process.env.POSTGRES_URL_NON_POOLING) || ''
+if (databaseUrl) {
+  process.env.DATABASE_URL = databaseUrl
+  process.env.DATABASE_URL_UNPOOLED = directConnectionUrl || databaseUrl
+}
+let prisma = globalThis.__scentraPrisma
+if (!prisma && databaseUrl) {
+  try { prisma = new PrismaClient({ datasourceUrl:databaseUrl }) }
+  catch (error) { console.error('Prisma client could not start - serving in-memory data:', error.message) }
+}
+if (prisma && process.env.NODE_ENV !== 'production') globalThis.__scentraPrisma = prisma
+const dbConfigured = Boolean(prisma)
 let dbEnabled = dbConfigured
 let dbRetryAt = 0
-const degradeToMemory = (error) => { if (!dbEnabled) return false; dbEnabled = false; dbRetryAt = Date.now() + 60 * 1000; console.error('Database unavailable - serving in-memory demo data:', error?.message || String(error)); return true }
-const retryDatabase = () => { if (dbConfigured && !dbEnabled && Date.now() >= dbRetryAt) { dbEnabled = true; dbRetryAt = 0 } }
+const dbRetryDelay = 30 * 1000
+let connectionFallbackUsed = false
+let databaseProbeInFlight = false
+let databaseRecoveryReady = false
+const connectionFallback = directConnectionUrl && directConnectionUrl !== databaseUrl ? directConnectionUrl : ''
+let databaseProblem = databaseUrl ? '' : 'No PostgreSQL connection string was found. The store is running on its local demo data.'
+// Demo-store edits are never abandoned: once anything is written while PostgreSQL is out of reach,
+// this process keeps serving the demo store so a recovered database cannot silently drop those edits.
+let fallbackChanged = false
+const describeDatabaseProblem = (error) => {
+  const message = String(error?.message || '')
+  if (isConfigFailure(error)) return 'The database connection string is invalid. Update DATABASE_URL in the hosting environment variables.'
+  if (/Can't reach database server|P1001/i.test(message)) return 'The database server could not be reached.'
+  if (/Timed out fetching a new connection|P2024/i.test(message)) return 'The database connection pool timed out.'
+  return 'The database is temporarily unavailable.'
+}
+const degradeToMemory = (error) => {
+  if (!dbEnabled) return false
+  // A pooled endpoint can go quiet while the database itself is healthy, so try the
+  // direct connection once before falling back to the local demo store.
+  if (!isConfigFailure(error) && connectionFallback && !connectionFallbackUsed) {
+    connectionFallbackUsed = true
+    try { prisma = new PrismaClient({ datasourceUrl:connectionFallback }); dbRetryAt = 0; console.warn('The pooled database endpoint could not be reached - switched to the direct connection'); return false }
+    catch (fallbackError) { console.error('Direct database connection failed:', fallbackError.message) }
+  }
+  dbEnabled = false
+  databaseRecoveryReady = false
+  databaseProblem = describeDatabaseProblem(error)
+  dbRetryAt = isConfigFailure(error) ? Number.POSITIVE_INFINITY : Date.now() + dbRetryDelay
+  console.error('Database unavailable - serving the local demo store:', error?.message || String(error))
+  return true
+}
+// A degraded process only goes back to PostgreSQL when a real query proves the database is back and
+// nothing has been written to the demo store in the meantime.
+const probeDatabase = async () => {
+  if (!dbConfigured || dbEnabled || databaseProbeInFlight || fallbackChanged || Date.now() < dbRetryAt) return false
+  databaseProbeInFlight = true
+  try {
+    await prisma.$queryRaw`select 1`
+    databaseRecoveryReady = true
+    databaseProblem = ''
+    return true
+  } catch (error) {
+    databaseRecoveryReady = false
+    databaseProblem = describeDatabaseProblem(error)
+    dbRetryAt = isConfigFailure(error) ? Number.POSITIVE_INFINITY : Date.now() + dbRetryDelay
+    return false
+  } finally { databaseProbeInFlight = false }
+}
+const isConfigFailure = (error) => /Error validating datasource|must start with the protocol|Environment variable not found|P1012|P1013/i.test(String(error?.message || ''))
+const isDatastoreFailure = (error) => {
+  if (String(error?.name || '').startsWith('PrismaClient')) return true
+  return /Error validating datasource|Can't reach database server|Environment variable not found|prisma\.[a-zA-Z]+\(|P100[0-9]|P101[0-9]|P1017|P2024|Connection terminated|Server has closed the connection|Timed out fetching a new connection/i.test(String(error?.message || ''))
+}
 const deliveryDefaults = { enabled:true, freeOver:75000, lagos:4000, other:12000 }
 const defaultSupportWhatsapp = '07041969346'
 const memoryOrders = []
@@ -31,7 +121,18 @@ const memorySettings = {
 const allowedOrigins = new Set([appUrl, 'http://localhost:5173', 'http://127.0.0.1:5173'].filter(Boolean))
 app.use(cors({ origin:(origin, callback) => callback(null, !origin || allowedOrigins.has(origin)) }))
 app.use(express.json({ limit:'6mb', verify:(req, _res, buffer) => { req.rawBody = buffer } }))
-app.use((_req, _res, next) => { retryDatabase(); next() })
+app.use((_req, _res, next) => {
+  // Data sources never switch mid-request: recovery lands on the next request, and only when the
+  // demo store holds no edits that PostgreSQL does not have yet.
+  if (databaseRecoveryReady && !dbEnabled && !fallbackChanged) {
+    dbEnabled = true
+    databaseRecoveryReady = false
+    databaseProblem = ''
+    console.warn('Database connection restored - the store is serving PostgreSQL again')
+    ensureSeed().catch((error) => console.error('Database setup failed:', error.message))
+  } else if (!dbEnabled && !fallbackChanged) probeDatabase().catch(() => {})
+  next()
+})
 
 const imagePool = [
   'https://images.unsplash.com/photo-1594035910387-fea47794261f?auto=format&fit=crop&w=900&q=85',
@@ -50,6 +151,48 @@ const seedProducts = [
   { id:'p5', name:'Dusk Body Mist', slug:'dusk-body-mist', description:'A sheer, skin-close mist for golden hour and slow evenings.', brand:'SCENTRA', gender:'unisex', note:'Floral', category:'Body Spray', categorySlug:'body-sprays', featured:true, onSale:false, images:[imagePool[4]], scentNotes:{top:'Mandarin, pear', middle:'Peony, tea', base:'Musk, tonka'}, variants:[{id:'p5-150',size:'150ml',price:18000,stock:22}] },
   { id:'p6', name:'Cedar + Clay Deodorant', slug:'cedar-clay-deodorant', description:'A clean, aluminium-free deodorant with a dry cedar finish.', brand:'SCENTRA', gender:'men', note:'Woody', category:'Deodorant', categorySlug:'deodorants', featured:false, onSale:true, images:[imagePool[5]], scentNotes:{top:'Grapefruit', middle:'Clary sage', base:'Cedar, vetiver'}, variants:[{id:'p6-75',size:'75g',price:9500,stock:31}] }
 ]
+
+// The demo store lives in memory, but a restart (tsx watch, a redeploy, a serverless cold start)
+// used to wipe it and make the admin look like it reset itself. Keep it on disk instead.
+const demoStorePath = (() => {
+  const explicit = String(process.env.SCENTRA_DEMO_STORE || '').trim()
+  if (explicit) { try { fs.mkdirSync(path.dirname(explicit), { recursive:true }); return explicit } catch { /* fall through to the defaults */ } }
+  const candidates = [path.resolve(fileURLToPath(new URL('../.data/', import.meta.url))), path.join(os.tmpdir(), 'scentra-demo-store')]
+  for (const dir of candidates) {
+    try { fs.mkdirSync(dir, { recursive:true }); fs.accessSync(dir, fs.constants.W_OK); return path.join(dir, 'demo-store.json') }
+    catch { /* read-only location, try the next one */ }
+  }
+  return ''
+})()
+let demoMutationCount = 0
+let demoWriteTimer = null
+const persistDemoStore = () => {
+  if (!demoStorePath) { fallbackChanged = true; demoMutationCount += 1; return }
+  fallbackChanged = true
+  demoMutationCount += 1
+  if (demoWriteTimer) return
+  demoWriteTimer = setTimeout(() => {
+    demoWriteTimer = null
+    try { fs.writeFileSync(demoStorePath, JSON.stringify({ savedAt:new Date().toISOString(), mutations:demoMutationCount, products:seedProducts, settings:memorySettings, coupons:memoryCoupons, orders:memoryOrders, customers:[...memoryCustomers.values()], subscribers:[...memorySubscribers] }, null, 2)) }
+    catch (error) { console.error('Could not save the local demo store:', error.message) }
+  }, 200)
+  demoWriteTimer.unref?.()
+}
+const savedDemoStore = (() => { if (!demoStorePath) return null; try { return JSON.parse(fs.readFileSync(demoStorePath, 'utf8')) } catch { return null } })()
+const storeStatus = () => ({ database:dbEnabled ? 'postgresql' : 'demo', databaseConfigured:dbConfigured, databaseUrlSource:databaseUrlSource || null, databaseUrlRepaired, problem:databaseProblem || undefined, demoStore:{ path:demoStorePath || null, localChanges:fallbackChanged, mutations:demoMutationCount, savedAt:savedDemoStore?.savedAt || null } })
+if (savedDemoStore) {
+  try {
+    if (Array.isArray(savedDemoStore.products) && savedDemoStore.products.length) seedProducts.splice(0, seedProducts.length, ...savedDemoStore.products)
+    if (savedDemoStore.settings) for (const [key, value] of Object.entries(savedDemoStore.settings)) if (value && typeof value === 'object') memorySettings[key] = { ...(memorySettings[key] || {}), ...value }
+    if (Array.isArray(savedDemoStore.coupons) && savedDemoStore.coupons.length) memoryCoupons.splice(0, memoryCoupons.length, ...savedDemoStore.coupons)
+    if (Array.isArray(savedDemoStore.orders)) memoryOrders.push(...savedDemoStore.orders)
+    if (Array.isArray(savedDemoStore.customers)) for (const customer of savedDemoStore.customers) if (customer?.email) memoryCustomers.set(customer.email, customer)
+    if (Array.isArray(savedDemoStore.subscribers)) for (const email of savedDemoStore.subscribers) memorySubscribers.add(email)
+    demoMutationCount = Number(savedDemoStore.mutations || 0)
+    fallbackChanged = demoMutationCount > 0
+    console.warn('Loaded ' + demoMutationCount + ' saved demo change(s) from ' + demoStorePath)
+  } catch (error) { console.error('Could not read the local demo store:', error.message) }
+}
 
 const money = (amount) => `NGN ${new Intl.NumberFormat('en-NG').format(amount)}`
 const orderNumber = () => `SC-${new Date().getFullYear()}-${crypto.randomBytes(4).toString('hex').toUpperCase().slice(0, 6)}`
@@ -168,6 +311,9 @@ async function notifyOrder(order, paid = true) {
 const safeNotify = (order, paid = true) => notifyOrder(order, paid).catch((error) => console.error('Order notification failed:', error.message))
 const adminAuth = (req, res, next) => { try { const token = req.headers.authorization?.replace('Bearer ', ''); req.admin = jwt.verify(token, process.env.JWT_SECRET || 'dev-secret'); next() } catch { res.status(401).json({ error:'Unauthorized' }) } }
 const cachePublic = (res, seconds = 30) => res.set('Cache-Control', `public, max-age=0, s-maxage=${seconds}, stale-while-revalidate=${seconds * 10}`)
+// Anything an administrator can edit must never be served from a CDN cache, otherwise saved edits
+// keep showing the old copy on the storefront until the cache expires.
+const cacheLive = (res) => res.set('Cache-Control', 'no-store, no-cache, must-revalidate')
 const cachePrivate = (res) => res.set('Cache-Control', 'private, no-store')
 
 const supabaseUrl = (process.env.SUPABASE_URL || '').replace(/\/+$/, '')
@@ -187,6 +333,7 @@ async function ensureCustomerFor(auth) {
     const existing = memoryCustomers.get(auth.email)
     const customer = existing || { id:auth.email, name, email:auth.email, phone:null, createdAt:new Date().toISOString() }
     memoryCustomers.set(auth.email, customer)
+    if (!existing) persistDemoStore()
     return customer
   }
   return prisma.customer.upsert({ where:{ email:auth.email }, update:{}, create:{ name, email:auth.email } })
@@ -224,7 +371,7 @@ app.post('/api/auth/signup', async (req, res) => {
   try {
     await supabaseRequest('/auth/v1/admin/users', { method:'POST', headers:supabaseAuthHeaders(process.env.SUPABASE_SERVICE_ROLE_KEY), body:JSON.stringify({ email, password, email_confirm:true, user_metadata:{ name } }) })
     if (dbEnabled) await prisma.customer.upsert({ where:{ email }, update:{ name }, create:{ name, email } })
-    else memoryCustomers.set(email, { id:email, name, email, phone:null, createdAt:new Date().toISOString() })
+    else { memoryCustomers.set(email, { id:email, name, email, phone:null, createdAt:new Date().toISOString() }); persistDemoStore() }
     cachePrivate(res).status(201).json({ message:'Account created. Signing you in...' })
   } catch (error) { res.status(409).json({ error:error.message === 'User already registered' ? 'An account already exists for this email. Sign in instead.' : (error.message || 'Could not create your account') }) }
 })
@@ -285,7 +432,7 @@ async function getSummary() {
   return { revenue:paid._sum.total || 0, orders, pending, lowStock }
 }
 
-app.get('/api/health', (_, res) => cachePrivate(res).json({ ok:true, database:dbEnabled ? 'postgresql' : 'memory', readyForLive:dbEnabled && Boolean(process.env.PAYSTACK_SECRET_KEY) && Boolean(process.env.JWT_SECRET) }))
+app.get('/api/health', (_, res) => cachePrivate(res).json({ ok:true, ...storeStatus(), readyForLive:dbEnabled && Boolean(process.env.PAYSTACK_SECRET_KEY) && Boolean(process.env.JWT_SECRET) }))
 app.get('/api/config', async (_, res) => {
   const [delivery, notifications] = await Promise.all([getSetting('delivery'), getSetting('notifications')]).catch(() => [deliveryDefaults, {}])
   cachePrivate(res).json({ paymentMode:process.env.PAYSTACK_SECRET_KEY ? 'live' : 'demo', paymentProvider:'Paystack', database:dbEnabled ? 'postgresql' : 'memory', accounts:{ provider:'supabase', ready:supabaseReady }, delivery:{ ...deliveryDefaults, ...delivery }, support:{ email:'hello@scentra.co', whatsapp:(notifications?.ownerWhatsapp) || process.env.OWNER_WHATSAPP || defaultSupportWhatsapp } })
@@ -296,17 +443,17 @@ app.get('/api/categories', (_, res) => cachePublic(res, 3600).json([
   { name:'Body Sprays', slug:'body-sprays', eyebrow:'Everyday ritual', description:'Effortless scent for every day.' },
   { name:'Deodorants', slug:'deodorants', eyebrow:'Fresh essentials', description:'Quiet confidence, all day.' }
 ]))
-app.get('/api/storefront', async (_, res) => { try { const [products, content] = await Promise.all([listProducts(), getSetting('content')]); cachePublic(res).json({ products, content }) } catch { res.status(500).json({ error:'Could not load the storefront' }) } })
-app.get('/api/products', async (req, res) => { try { cachePublic(res).json(await listProducts(req.query)) } catch { res.status(500).json({ error:'Could not load products' }) } })
-app.get('/api/products/:slug', async (req, res) => { const product = (await listProducts()).find((item) => item.slug === req.params.slug); product ? cachePublic(res).json(product) : res.status(404).json({ error:'Product not found' }) })
-app.get('/api/content', async (_, res) => cachePublic(res).json(await getSetting('content')))
+app.get('/api/storefront', async (_, res) => { try { const [products, content] = await Promise.all([listProducts(), getSetting('content')]); cacheLive(res).json({ products, content }) } catch { res.status(500).json({ error:'Could not load the storefront' }) } })
+app.get('/api/products', async (req, res) => { try { cacheLive(res).json(await listProducts(req.query)) } catch { res.status(500).json({ error:'Could not load products' }) } })
+app.get('/api/products/:slug', async (req, res) => { const product = (await listProducts()).find((item) => item.slug === req.params.slug); product ? cacheLive(res).json(product) : res.status(404).json({ error:'Product not found' }) })
+app.get('/api/content', async (_, res) => cacheLive(res).json(await getSetting('content')))
 app.post('/api/newsletter', async (req, res) => {
   const parsed = z.string().email().safeParse(req.body?.email)
   if (!parsed.success) return res.status(400).json({ error:'Enter a valid email address' })
   const email = parsed.data.toLowerCase()
   try {
     if (dbEnabled) await prisma.newsletterSubscriber.upsert({ where:{ email }, update:{}, create:{ email } })
-    else memorySubscribers.add(email)
+    else { memorySubscribers.add(email); persistDemoStore() }
     res.status(201).json({ message:'You are on the list. Watch your inbox.' })
   } catch { res.status(500).json({ error:'Could not save your subscription' }) }
 })
@@ -373,6 +520,7 @@ app.post('/api/orders', async (req, res) => {
       }
       order = { id:number, orderNumber:number, status:'PENDING', customerName:body.customer.name, customerEmail:body.customer.email, customerPhone:body.customer.phone, shippingAddress:body.shippingAddress, items, subtotal, discount, deliveryFee, couponCode:coupon?.code, total:subtotal-discount+deliveryFee, createdAt:new Date().toISOString() }
       memoryOrders.unshift(order)
+      persistDemoStore()
     }
 
     if (!process.env.PAYSTACK_SECRET_KEY) {
@@ -387,11 +535,12 @@ app.post('/api/orders', async (req, res) => {
   } catch (error) {
     if (dbEnabled && order?.id) { try { const current = await prisma.order.findUnique({ where:{ id:order.id }, include:{ items:true } }); if (current) { await restoreReservation(current); await prisma.order.update({ where:{ id:order.id }, data:{ status:'CANCELLED', reservationExpiresAt:null } }) } } catch (cleanupError) { console.error('Order cleanup failed:', cleanupError.message) } }
     const failure = String(error?.message || '')
-    if (/Can't reach database server|PrismaClientInitializationError|P1001|Server has closed the connection|Connection terminated|Timed out fetching a new connection/i.test(failure)) {
-      console.error('Order creation failed - database unreachable:', failure.slice(0, 200))
+    if (isDatastoreFailure(error)) {
+      degradeToMemory(error)
+      console.error('Order creation failed - database unavailable:', failure.slice(0, 200))
       return res.status(503).json({ error:'Our order system is briefly unavailable. Please try again in a moment, or send your order to us on WhatsApp.' })
     }
-    if (!dbEnabled && order) { const index=memoryOrders.findIndex((item)=>item.id===order.id); if(index>=0)memoryOrders.splice(index,1); for(const item of order.items||[]){const product=seedProducts.find((entry)=>entry.id===item.productId);const variant=product?.variants.find((entry)=>entry.id===item.variantId);if(variant)variant.stock+=item.qty} if(order.couponCode){const coupon=memoryCoupons.find((item)=>item.code===order.couponCode);if(coupon&&coupon.usedCount>0)coupon.usedCount-=1} }
+    if (!dbEnabled && order) { const index=memoryOrders.findIndex((item)=>item.id===order.id); if(index>=0)memoryOrders.splice(index,1); for(const item of order.items||[]){const product=seedProducts.find((entry)=>entry.id===item.productId);const variant=product?.variants.find((entry)=>entry.id===item.variantId);if(variant)variant.stock+=item.qty} if(order.couponCode){const coupon=memoryCoupons.find((item)=>item.code===order.couponCode);if(coupon&&coupon.usedCount>0)coupon.usedCount-=1} persistDemoStore() }
     res.status(409).json({ error:error.message || 'Unable to create order' })
   }
 })
@@ -411,7 +560,7 @@ app.post('/api/payments/paystack/webhook', async (req, res) => {
       if (current && current.status === 'PENDING') { const order = await prisma.order.update({ where:{ id:current.id }, data:{ status:'PAID', paymentReference:reference, reservationExpiresAt:null }, include:{ items:true } }); safeNotify(order, true) }
     } else {
       const order = memoryOrders.find((item) => item.orderNumber === reference)
-      if (order && order.status === 'PENDING') { order.status = 'PAID'; order.paymentReference = reference; safeNotify(order, true) }
+      if (order && order.status === 'PENDING') { order.status = 'PAID'; order.paymentReference = reference; persistDemoStore(); safeNotify(order, true) }
     }
   } catch (error) { console.error('Webhook handling failed:', error.message) }
   res.sendStatus(200)
@@ -446,7 +595,7 @@ app.post('/api/admin/login', async (req, res) => {
 
 app.get('/api/admin/orders', adminAuth, async (_, res) => res.json(dbEnabled ? await prisma.order.findMany({ include:{ items:true }, orderBy:{ createdAt:'desc' } }) : memoryOrders))
 app.patch('/api/admin/orders/:id', adminAuth, async (req, res) => {
-  if (!dbEnabled) { const order = memoryOrders.find((item) => item.id === req.params.id); if (order) order.status = req.body.status; return res.json(order || { ok:true }) }
+  if (!dbEnabled) { const order = memoryOrders.find((item) => item.id === req.params.id); if (order) { order.status = req.body.status; persistDemoStore() } return res.json(order || { ok:true }) }
   const current = await prisma.order.findUnique({ where:{ id:req.params.id }, include:{ items:true } })
   if (!current) return res.status(404).json({ error:'Order not found' })
   if (req.body.status === 'CANCELLED' && current.status === 'PENDING') await (async () => { await restoreReservation(current); await prisma.order.update({ where:{ id:current.id }, data:{ status:'CANCELLED', reservationExpiresAt:null } }) })()
@@ -460,19 +609,19 @@ app.post('/api/admin/products', adminAuth, async (req, res) => {
   const categorySlug = body.categorySlug || 'custom-perfumes'
   const variants=(body.variants?.length?body.variants:[{ size:body.size || '50ml', price:body.price, stock:body.stock }]).map((variant,index)=>({ id:variant.id || `variant-${Date.now()}-${index}`, size:variant.size, price:Number(variant.price || 0), stock:Number(variant.stock || 0) }))
   const images=body.images?.length?body.images:[imagePool[0]]
-  if (!dbEnabled) { const product = { id:`demo-${Date.now()}`, name:body.name, slug:body.slug||slugify(body.name), description:body.description || '', metaDescription:body.metaDescription||'', brand:body.brand || 'SCENTRA', gender:body.gender || 'unisex', note:body.note || '', category:body.category || 'Custom Perfume', categorySlug, images, scentNotes:{}, featured:Boolean(body.featured), onSale:Boolean(body.onSale), variants }; seedProducts.unshift(product); return res.status(201).json(product) }
+  if (!dbEnabled) { const product = { id:`demo-${Date.now()}`, name:body.name, slug:body.slug||slugify(body.name), description:body.description || '', metaDescription:body.metaDescription||'', brand:body.brand || 'SCENTRA', gender:body.gender || 'unisex', note:body.note || '', category:body.category || 'Custom Perfume', categorySlug, images, scentNotes:{}, featured:Boolean(body.featured), onSale:Boolean(body.onSale), variants }; seedProducts.unshift(product); persistDemoStore(); return res.status(201).json(product) }
   const category = await prisma.category.upsert({ where:{ slug:categorySlug }, update:{ name:body.category }, create:{ name:body.category, slug:categorySlug } })
   const product = await prisma.product.create({ data:{ name:body.name, slug:body.slug || slugify(body.name), description:body.description || '', metaDescription:body.metaDescription || '', brand:body.brand || 'SCENTRA', gender:body.gender || 'unisex', note:body.note || '', images, scentNotes:body.scentNotes || {}, categoryId:category.id, featured:Boolean(body.featured), onSale:Boolean(body.onSale), variants:{ create:variants.map(({size,price,stock})=>({size,price,stock})) } }, include:{ category:true, variants:true } })
   res.status(201).json({ ...product, category:product.category.name, categorySlug:product.category.slug })
 })
-app.patch('/api/admin/products/:id', adminAuth, async (req, res) => { const body=req.body; if (!dbEnabled) { const product=seedProducts.find((item)=>item.id===req.params.id); if(!product)return res.status(404).json({error:'Product not found'}); Object.assign(product,{name:body.name??product.name,slug:body.slug??product.slug,description:body.description??product.description,metaDescription:body.metaDescription??product.metaDescription,brand:body.brand??product.brand,gender:body.gender??product.gender,note:body.note??product.note,images:Array.isArray(body.images)?body.images:product.images,featured:body.featured??product.featured,onSale:body.onSale??product.onSale}); if(body.variants)product.variants=body.variants.map((variant,index)=>({...variant,id:variant.id||`variant-${Date.now()}-${index}`,price:Number(variant.price),stock:Number(variant.stock)})); return res.json(product) } const data={}; for(const key of ['name','slug','description','metaDescription','brand','gender','note','featured','onSale'])if(body[key]!==undefined)data[key]=body[key];if(Array.isArray(body.images))data.images=body.images; await prisma.product.update({where:{id:req.params.id},data}); if(body.variants)for(const variant of body.variants){if(variant.id)await prisma.productVariant.update({where:{id:variant.id},data:{size:variant.size,price:Number(variant.price),stock:Number(variant.stock)}});else await prisma.productVariant.create({data:{productId:req.params.id,size:variant.size,price:Number(variant.price),stock:Number(variant.stock)}})} const product=await prisma.product.findUnique({where:{id:req.params.id},include:{category:true,variants:true}});res.json({...product,category:product.category.name,categorySlug:product.category.slug}) })
-app.delete('/api/admin/products/:id', adminAuth, async (req, res) => { if (!dbEnabled) { const index = seedProducts.findIndex((item) => item.id === req.params.id); if (index >= 0) seedProducts.splice(index, 1); return res.sendStatus(204) } await prisma.product.delete({ where:{ id:req.params.id } }); res.sendStatus(204) })
+app.patch('/api/admin/products/:id', adminAuth, async (req, res) => { const body=req.body; if (!dbEnabled) { const product=seedProducts.find((item)=>item.id===req.params.id); if(!product)return res.status(404).json({error:'Product not found'}); Object.assign(product,{name:body.name??product.name,slug:body.slug??product.slug,description:body.description??product.description,metaDescription:body.metaDescription??product.metaDescription,brand:body.brand??product.brand,gender:body.gender??product.gender,note:body.note??product.note,images:Array.isArray(body.images)?body.images:product.images,featured:body.featured??product.featured,onSale:body.onSale??product.onSale}); if(body.variants)product.variants=body.variants.map((variant,index)=>({...variant,id:variant.id||`variant-${Date.now()}-${index}`,price:Number(variant.price),stock:Number(variant.stock)})); persistDemoStore(); return res.json(product) } const data={}; for(const key of ['name','slug','description','metaDescription','brand','gender','note','featured','onSale'])if(body[key]!==undefined)data[key]=body[key];if(Array.isArray(body.images))data.images=body.images; await prisma.product.update({where:{id:req.params.id},data}); if(body.variants)for(const variant of body.variants){if(variant.id)await prisma.productVariant.update({where:{id:variant.id},data:{size:variant.size,price:Number(variant.price),stock:Number(variant.stock)}});else await prisma.productVariant.create({data:{productId:req.params.id,size:variant.size,price:Number(variant.price),stock:Number(variant.stock)}})} const product=await prisma.product.findUnique({where:{id:req.params.id},include:{category:true,variants:true}});res.json({...product,category:product.category.name,categorySlug:product.category.slug}) })
+app.delete('/api/admin/products/:id', adminAuth, async (req, res) => { if (!dbEnabled) { const index = seedProducts.findIndex((item) => item.id === req.params.id); if (index >= 0) { seedProducts.splice(index, 1); persistDemoStore() } return res.sendStatus(204) } await prisma.product.delete({ where:{ id:req.params.id } }); res.sendStatus(204) })
 app.get('/api/admin/customers', adminAuth, async (_, res) => cachePrivate(res).json(await listCustomers()))
 app.get('/api/admin/coupons', adminAuth, async (_, res) => res.json(dbEnabled ? await prisma.coupon.findMany({ orderBy:{ expiryDate:'desc' } }) : memoryCoupons))
-app.post('/api/admin/coupons', adminAuth, async (req, res) => { const data = { code:req.body.code.toUpperCase(), type:req.body.type, value:Number(req.body.value), expiryDate:new Date(req.body.expiryDate), usageLimit:req.body.usageLimit ? Number(req.body.usageLimit) : null, active:true }; if (!dbEnabled) { const coupon={ id:`coupon-${Date.now()}`, ...data, expiryDate:data.expiryDate.toISOString(), usedCount:0 }; memoryCoupons.unshift(coupon); return res.status(201).json(coupon) } res.status(201).json(await prisma.coupon.create({ data })) })
-app.delete('/api/admin/coupons/:id', adminAuth, async (req, res) => { if (!dbEnabled) { const index=memoryCoupons.findIndex((item)=>item.id===req.params.id); if(index>=0)memoryCoupons.splice(index,1); return res.sendStatus(204) } await prisma.coupon.delete({ where:{ id:req.params.id } }); res.sendStatus(204) })
+app.post('/api/admin/coupons', adminAuth, async (req, res) => { const data = { code:req.body.code.toUpperCase(), type:req.body.type, value:Number(req.body.value), expiryDate:new Date(req.body.expiryDate), usageLimit:req.body.usageLimit ? Number(req.body.usageLimit) : null, active:true }; if (!dbEnabled) { const coupon={ id:`coupon-${Date.now()}`, ...data, expiryDate:data.expiryDate.toISOString(), usedCount:0 }; memoryCoupons.unshift(coupon); persistDemoStore(); return res.status(201).json(coupon) } res.status(201).json(await prisma.coupon.create({ data })) })
+app.delete('/api/admin/coupons/:id', adminAuth, async (req, res) => { if (!dbEnabled) { const index=memoryCoupons.findIndex((item)=>item.id===req.params.id); if(index>=0){memoryCoupons.splice(index,1);persistDemoStore()} return res.sendStatus(204) } await prisma.coupon.delete({ where:{ id:req.params.id } }); res.sendStatus(204) })
 app.get('/api/admin/settings', adminAuth, async (_, res) => res.json({ content:await getSetting('content'), notifications:await getSetting('notifications'), delivery:await getSetting('delivery') }))
-app.put('/api/admin/settings/:key', adminAuth, async (req, res) => { if (!['content','notifications','delivery'].includes(req.params.key)) return res.status(400).json({ error:'Unknown settings group' }); if (!dbEnabled) { memorySettings[req.params.key]={...memorySettings[req.params.key],...req.body}; return res.json(memorySettings[req.params.key]) } const setting=await prisma.siteSetting.upsert({ where:{ key:req.params.key }, update:{ value:req.body }, create:{ key:req.params.key, value:req.body } }); res.json(setting.value) })
+app.put('/api/admin/settings/:key', adminAuth, async (req, res) => { if (!['content','notifications','delivery'].includes(req.params.key)) return res.status(400).json({ error:'Unknown settings group' }); if (!dbEnabled) { memorySettings[req.params.key]={...memorySettings[req.params.key],...req.body}; persistDemoStore(); return res.json(memorySettings[req.params.key]) } const setting=await prisma.siteSetting.upsert({ where:{ key:req.params.key }, update:{ value:req.body }, create:{ key:req.params.key, value:req.body } }); res.json(setting.value) })
 app.get('/api/admin/summary', adminAuth, async (_, res) => cachePrivate(res).json(await getSummary()))
 app.get('/api/admin/dashboard', adminAuth, async (_, res) => {
   const load = async () => {
@@ -483,7 +632,7 @@ app.get('/api/admin/dashboard', adminAuth, async (_, res) => {
       dbEnabled ? prisma.coupon.findMany({ orderBy:{ expiryDate:'desc' } }) : memoryCoupons,
       Promise.all([getSetting('content'), getSetting('notifications'), getSetting('delivery')]).then(([content, notifications, delivery]) => ({ content, notifications, delivery }))
     ])
-    return { summary, orders, customers, coupons, settings }
+    return { summary, orders, customers, coupons, settings, store:storeStatus() }
   }
   try {
     cachePrivate(res).json(await load())
@@ -538,6 +687,11 @@ app.use((error, _req, res, _next) => {
   console.error('Unhandled API error:', error?.message || error)
   if (res.headersSent) return
   if (error?.type === 'entity.too.large' || error?.status === 413) return res.status(413).json({ error:'That upload is too large. Please use an image under 6MB.' })
+  // A lost database connection must never look like a successful save: say plainly that nothing was written.
+  if (isDatastoreFailure(error)) {
+    degradeToMemory(error)
+    return res.status(503).json({ error:'The database is unreachable, so that change was not saved. Please try again once the connection is restored.' })
+  }
   res.status(error?.status || 500).json({ error:'Something went wrong on our side. Please try again.' })
 })
 

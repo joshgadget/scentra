@@ -1,4 +1,5 @@
 import { trackPage, trackPurchase } from './analytics.js'
+import { faqGroups } from './faq-data.js'
 
 const DEFAULT_IMAGE = 'https://images.unsplash.com/photo-1595425970377-c9703cf48b6d?auto=format&fit=crop&w=1200&q=80'
 
@@ -99,6 +100,19 @@ export function applyMeta(pathname, products = [], content = {}) {
   } else if (pathname === '/track') {
     title = 'Track your order · Scentra'
     description = 'Enter your order number to see the latest delivery status.'
+  } else if (pathname === '/faq') {
+    const copy = editorialTitles.faq
+    title = copy[0] + ' · Scentra'
+    description = copy[1]
+    jsonLd = {
+      '@context': 'https://schema.org',
+      '@type': 'FAQPage',
+      mainEntity: faqGroups.flatMap((group) => group.items).map((item) => ({
+        '@type': 'Question',
+        name: item.question,
+        acceptedAnswer: { '@type': 'Answer', text: item.answer }
+      }))
+    }
   } else {
     const type = pathname.split('/').filter(Boolean)[0]
     const copy = editorialTitles[type]

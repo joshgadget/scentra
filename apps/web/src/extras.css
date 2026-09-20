@@ -83,6 +83,11 @@
 .payment-choice.soon{border-style:dashed;border-color:var(--border);color:var(--slate)}
 .payment-choice.soon strong{color:var(--slate)}
 .soon-badge{background:var(--light);border:1px solid var(--border);color:var(--slate);font-size:10px;letter-spacing:.1em;text-transform:uppercase;padding:2px 8px}
+/* stack the option title above its description so the badge never collides with the copy */
+.payment-choice{flex-direction:column;align-items:flex-start;gap:7px}
+.payment-choice>div{flex-wrap:wrap;row-gap:6px}
+.payment-choice>div strong{white-space:nowrap}
+.payment-choice small{line-height:1.7}
 .success-note{font-size:12px;color:var(--slate)}
 /* 404 */
 .notfound{padding:90px 0 110px;text-align:center;max-width:760px}
@@ -146,3 +151,9 @@
 .image-upload{display:flex;flex-direction:column;gap:6px;font-size:12px}
 /* order confirmation card: 2x2 grid on wider screens */
 @media(min-width:600px){.success-page .success-card{grid-template-columns:repeat(2,1fr)}.success-page .success-card div{border-right:1px solid var(--border);border-bottom:1px solid var(--border)}.success-page .success-card div:nth-child(2n){border-right:0}.success-page .success-card div:nth-last-child(-n+2){border-bottom:0}}
+
+/* Admin data-source banner: makes it obvious when the store is running on demo data */
+.admin-notice{margin:18px 35px 0;display:flex;gap:12px;align-items:flex-start;background:#fff8e6;border:1px solid #e6d5a8;border-left:3px solid #b58900;padding:12px 18px;font-size:12px}
+.admin-notice svg{width:16px;height:16px;flex:none;margin-top:1px;color:#8a6d00}
+.admin-notice div{display:flex;flex-direction:column;gap:3px}
+.admin-notice span,.admin-notice small{color:var(--slate);font-size:11px}
