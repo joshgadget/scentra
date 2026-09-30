@@ -9,6 +9,7 @@ import cors from 'cors'
 import jwt from 'jsonwebtoken'
 import { z } from 'zod'
 import { PrismaClient } from '@prisma/client'
+import { sendEmail, emailStatus, supportEmail, paymentReceiptEmail, orderReceivedEmail, orderStatusEmail, ownerOrderAlertEmail, newsletterWelcomeEmail } from './emails.js'
 
 const app = express()
 const port = process.env.PORT || 4000
@@ -302,25 +303,30 @@ async function calculateCoupon(code, subtotal) {
   return { discount, coupon }
 }
 
-async function notifyOrder(order, paid = true) {
-  const items = (order.items || []).map((item) => `${item.qty}x ${item.name} (${item.size})`).join('\n')
-  const address = typeof order.shippingAddress === 'string' ? order.shippingAddress : Object.values(order.shippingAddress || {}).filter(Boolean).join(', ')
-  const paymentNote = paid ? `Payment: confirmed - ${money(order.total)}` : `Payment: bank transfer - reply with the account details to make payment to`
-  const ownerText = `New Scentra order ${order.orderNumber}\n${order.customerName} - ${order.customerPhone || ''}\n${items}\nTotal: ${money(order.total)}\n${address}\n\n${paymentNote}`
+const sendSafely = (to, message) => sendEmail(to, message).catch((error) => { console.error(`Email to ${to} failed:`, error.message); return null })
+
+async function notifyOrder(order, paid = true, options = {}) {
   const notifications = await getSetting('notifications')
   const ownerEmail = notifications.ownerEmail || process.env.OWNER_EMAIL
   const ownerWhatsapp = notifications.ownerWhatsapp || process.env.OWNER_WHATSAPP || defaultSupportWhatsapp
-  if (process.env.SMTP_HOST) {
-    const { default:nodemailer } = await import('nodemailer')
-    const transporter = nodemailer.createTransport({ host:process.env.SMTP_HOST, port:Number(process.env.SMTP_PORT || 587), secure:Number(process.env.SMTP_PORT) === 465, auth:{ user:process.env.SMTP_USER, pass:process.env.SMTP_PASS } })
-    if (ownerEmail) await transporter.sendMail({ from:process.env.SMTP_USER, to:ownerEmail, subject:paid ? `New paid order ${order.orderNumber}` : `New order ${order.orderNumber} - awaiting confirmation`, text:ownerText })
-    if (paid) await transporter.sendMail({ from:process.env.SMTP_USER, to:order.customerEmail, subject:`Your Scentra order ${order.orderNumber} is confirmed`, text:`Hello ${order.customerName},\n\nThank you for your order. Your payment is confirmed and we are preparing your fragrance.\n\n${items}\nTotal: ${money(order.total)}\n\nWe will contact you when it is on the way.\n\nScentra` })
-  }
+  const messages = [sendSafely(order.customerEmail, paid ? paymentReceiptEmail(order, options) : orderReceivedEmail(order))]
+  if (ownerEmail) messages.push(sendSafely(ownerEmail, ownerOrderAlertEmail(order, { paid })))
+  await Promise.all(messages)
   if (process.env.TWILIO_ACCOUNT_SID && ownerWhatsapp) {
+    const items = (order.items || []).map((item) => `${item.qty}x ${item.name} (${item.size})`).join('\n')
+    const address = typeof order.shippingAddress === 'string' ? order.shippingAddress : Object.values(order.shippingAddress || {}).filter(Boolean).join(', ')
+    const paymentNote = paid ? `Payment: confirmed - ${money(order.total)}` : `Payment: bank transfer - reply with the account details to make payment to`
+    const ownerText = `New Scentra order ${order.orderNumber}\n${order.customerName} - ${order.customerPhone || ''}\n${items}\nTotal: ${money(order.total)}\n${address}\n\n${paymentNote}`
     await fetch(`https://api.twilio.com/2010-04-01/Accounts/${process.env.TWILIO_ACCOUNT_SID}/Messages.json`, { method:'POST', headers:{ Authorization:`Basic ${Buffer.from(`${process.env.TWILIO_ACCOUNT_SID}:${process.env.TWILIO_AUTH_TOKEN}`).toString('base64')}`, 'Content-Type':'application/x-www-form-urlencoded' }, body:new URLSearchParams({ From:process.env.TWILIO_WHATSAPP_FROM, To:`whatsapp:${ownerWhatsapp}`, Body:ownerText }) })
   }
 }
 
+const notifyStatusChange = async (order, previousStatus) => {
+  if (!order || order.status === previousStatus) return
+  if (order.status === 'PAID') return notifyOrder(order, true)
+  const message = orderStatusEmail(order)
+  if (message) await sendSafely(order.customerEmail, message)
+}
 const safeNotify = (order, paid = true) => notifyOrder(order, paid).catch((error) => console.error('Order notification failed:', error.message))
 const adminAuth = (req, res, next) => { try { const token = req.headers.authorization?.replace('Bearer ', ''); req.admin = jwt.verify(token, process.env.JWT_SECRET || 'dev-secret'); next() } catch { res.status(401).json({ error:'Unauthorized' }) } }
 const cachePublic = (res, seconds = 30) => res.set('Cache-Control', `public, max-age=0, s-maxage=${seconds}, stale-while-revalidate=${seconds * 10}`)
@@ -445,10 +451,10 @@ async function getSummary() {
   return { revenue:paid._sum.total || 0, orders, pending, lowStock }
 }
 
-app.get('/api/health', (_, res) => cachePrivate(res).json({ ok:true, ...storeStatus(), readyForLive:dbEnabled && Boolean(process.env.PAYSTACK_SECRET_KEY) && Boolean(process.env.JWT_SECRET) }))
+app.get('/api/health', (_, res) => cachePrivate(res).json({ ok:true, ...storeStatus(), email:emailStatus(), readyForLive:dbEnabled && Boolean(process.env.PAYSTACK_SECRET_KEY) && Boolean(process.env.JWT_SECRET) }))
 app.get('/api/config', async (_, res) => {
   const [delivery, notifications] = await Promise.all([getSetting('delivery'), getSetting('notifications')]).catch(() => [deliveryDefaults, {}])
-  cachePrivate(res).json({ paymentMode:process.env.PAYSTACK_SECRET_KEY ? 'live' : 'demo', paymentProvider:'Paystack', database:dbEnabled ? 'postgresql' : 'memory', accounts:{ provider:'supabase', ready:supabaseReady }, delivery:{ ...deliveryDefaults, ...delivery }, support:{ email:'hello@scentra.co', whatsapp:(notifications?.ownerWhatsapp) || process.env.OWNER_WHATSAPP || defaultSupportWhatsapp } })
+  cachePrivate(res).json({ paymentMode:process.env.PAYSTACK_SECRET_KEY ? 'live' : 'demo', paymentProvider:'Paystack', database:dbEnabled ? 'postgresql' : 'memory', accounts:{ provider:'supabase', ready:supabaseReady }, delivery:{ ...deliveryDefaults, ...delivery }, support:{ email:supportEmail(), whatsapp:(notifications?.ownerWhatsapp) || process.env.OWNER_WHATSAPP || defaultSupportWhatsapp } })
 })
 app.get('/api/categories', (_, res) => cachePublic(res, 3600).json([
   { name:'Custom Perfumes', slug:'custom-perfumes', eyebrow:'Made by us', description:'Small-batch signatures blended in Lagos.' },
@@ -465,8 +471,10 @@ app.post('/api/newsletter', async (req, res) => {
   if (!parsed.success) return res.status(400).json({ error:'Enter a valid email address' })
   const email = parsed.data.toLowerCase()
   try {
+    const existing = dbEnabled ? await prisma.newsletterSubscriber.findUnique({ where:{ email } }) : memorySubscribers.has(email)
     if (dbEnabled) await prisma.newsletterSubscriber.upsert({ where:{ email }, update:{}, create:{ email } })
     else { memorySubscribers.add(email); persistDemoStore() }
+    if (!existing) await sendSafely(email, newsletterWelcomeEmail())
     res.status(201).json({ message:'You are on the list. Watch your inbox.' })
   } catch { res.status(500).json({ error:'Could not save your subscription' }) }
 })
@@ -570,10 +578,10 @@ app.post('/api/payments/paystack/webhook', async (req, res) => {
   try {
     if (dbEnabled) {
       const current = await prisma.order.findUnique({ where:{ orderNumber:reference }, include:{ items:true } })
-      if (current && current.status === 'PENDING') { const order = await prisma.order.update({ where:{ id:current.id }, data:{ status:'PAID', paymentReference:reference, reservationExpiresAt:null }, include:{ items:true } }); safeNotify(order, true) }
+      if (current && current.status === 'PENDING') { const order = await prisma.order.update({ where:{ id:current.id }, data:{ status:'PAID', paymentReference:reference, reservationExpiresAt:null }, include:{ items:true } }); await notifyOrder(order, true, { paymentChannel:req.body.data?.channel }) }
     } else {
       const order = memoryOrders.find((item) => item.orderNumber === reference)
-      if (order && order.status === 'PENDING') { order.status = 'PAID'; order.paymentReference = reference; persistDemoStore(); safeNotify(order, true) }
+      if (order && order.status === 'PENDING') { order.status = 'PAID'; order.paymentReference = reference; persistDemoStore(); await notifyOrder(order, true, { paymentChannel:req.body.data?.channel }) }
     }
   } catch (error) { console.error('Webhook handling failed:', error.message) }
   res.sendStatus(200)
@@ -608,14 +616,19 @@ app.post('/api/admin/login', async (req, res) => {
 
 app.get('/api/admin/orders', adminAuth, async (_, res) => res.json(dbEnabled ? await prisma.order.findMany({ include:{ items:true }, orderBy:{ createdAt:'desc' } }) : memoryOrders))
 app.patch('/api/admin/orders/:id', adminAuth, async (req, res) => {
-  if (!dbEnabled) { const order = memoryOrders.find((item) => item.id === req.params.id); if (order) { order.status = req.body.status; persistDemoStore() } return res.json(order || { ok:true }) }
+  if (!dbEnabled) {
+    const order = memoryOrders.find((item) => item.id === req.params.id)
+    if (order) { const previousStatus = order.status; order.status = req.body.status; persistDemoStore(); await notifyStatusChange(order, previousStatus).catch((error) => console.error('Order status email failed:', error.message)) }
+    return res.json(order || { ok:true })
+  }
   const current = await prisma.order.findUnique({ where:{ id:req.params.id }, include:{ items:true } })
   if (!current) return res.status(404).json({ error:'Order not found' })
   if (req.body.status === 'CANCELLED' && current.status === 'PENDING') await (async () => { await restoreReservation(current); await prisma.order.update({ where:{ id:current.id }, data:{ status:'CANCELLED', reservationExpiresAt:null } }) })()
   else await prisma.order.update({ where:{ id:current.id }, data:{ status:req.body.status, reservationExpiresAt:req.body.status === 'PAID' ? null : undefined } })
-  res.json(await prisma.order.findUnique({ where:{ id:current.id } }))
+  const updated = await prisma.order.findUnique({ where:{ id:current.id }, include:{ items:true } })
+  await notifyStatusChange(updated, current.status).catch((error) => console.error('Order status email failed:', error.message))
+  res.json(updated)
 })
-
 app.get('/api/admin/products', adminAuth, async (_, res) => res.json(await listProducts()))
 app.post('/api/admin/products', adminAuth, async (req, res) => {
   const body = req.body

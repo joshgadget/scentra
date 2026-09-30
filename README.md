@@ -1,4 +1,4 @@
-﻿# Scentra - Luxury Fragrance Commerce
+# Scentra - Luxury Fragrance Commerce
 
 Scentra is a full-stack fragrance storefront with a React/Vite customer experience and an Express/Prisma administration API.
 
@@ -22,7 +22,7 @@ Default local admin:
 
 ## Database and accounts (Supabase)
 
-Scentra uses Supabase for both PostgreSQL persistence and customer accounts (Auth). Set these in `apps/api/.env.local` (API) and the Vercel project:
+Scentra uses Supabase for both PostgreSQL persistence and customer accounts (Auth). Set these in `apps/api/.env` (start from `apps/api/.env.example`) and in the Vercel project:
 
 - `DATABASE_URL` - Supabase transaction pooler connection string (Prisma runtime).
 - `DATABASE_URL_UNPOOLED` - Supabase direct connection used by Prisma schema commands.
@@ -46,9 +46,38 @@ npm run db:push
 
 3. In Supabase Auth, enable the Email provider. Accounts created through the API are confirmed automatically.
 
+## Email notifications (Brevo)
+
+Order emails are sent through [Brevo](https://www.brevo.com). In Brevo, add your sender address
+under **Senders, Domains & Dedicated IPs** and click the verification link Brevo emails you (no DNS
+changes needed to start; authenticating the domain later with DKIM/SPF improves deliverability).
+Then set these in the API environment (and in the Vercel project):
+
+- `BREVO_API_KEY` - v3 API key from **SMTP & API, API Keys**. When it is missing, emails are
+  skipped and the API logs a warning instead of failing.
+- `EMAIL_FROM` - the sender verified in Brevo, e.g. `Scentra <scentraofficialhq@gmail.com>` (the default).
+- `EMAIL_REPLY_TO` - optional reply-to address (defaults to the `EMAIL_FROM` address).
+- `SUPPORT_EMAIL` - address shown in email footers (default `hello@scentra.co`).
+- `OWNER_EMAIL` - inbox that receives the new-order alert. Can also be set in Admin, Settings,
+  Notification settings, which takes precedence.
+- `APP_URL` - public storefront URL used in email links, e.g. `https://scentra.co`. Falls back
+  to the Vercel deployment URL, so set it for production.
+
+Emails sent automatically:
+
+- Payment receipt to the customer when Paystack confirms a payment, or when an admin marks an
+  order Paid.
+- "We have your order" confirmation to the customer for bank-transfer (WhatsApp) orders.
+- Order status updates - Processing, Shipped, Delivered and Cancelled - when an admin changes the
+  status.
+- New-order alert to the owner.
+- Newsletter welcome with the `WELCOME10` promo code for new subscribers.
+
+Add the same variables in Vercel under Project, Settings, Environment Variables (Production and
+Preview), then redeploy. `GET /api/health` reports `email.provider` and `email.ready`.
+
 ## Optional integrations
 
-- `SMTP_*` and `OWNER_EMAIL` enable order emails.
 - `TWILIO_*` and `OWNER_WHATSAPP` enable optional WhatsApp alerts.
 
 ## Verify
