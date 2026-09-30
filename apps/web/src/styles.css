@@ -57,3 +57,12 @@
 .faq-help-actions{display:flex;gap:12px;flex-wrap:wrap}
 @media(max-width:999px){.faq-hero{padding:80px 0 35px}.faq-help{grid-template-columns:1fr;justify-items:start;margin-top:70px}}
 @media(max-width:599px){.faq-hero{padding:60px 0 30px}.faq-search{padding:2px 4px 2px 16px;gap:10px}.faq-search input{height:46px}.faq-count{font-size:10px}.faq-group{padding-top:40px}.faq-group-head h2{font-size:22px}.faq-question{grid-template-columns:24px minmax(0,1fr) 30px;gap:12px;padding:18px 0;font-size:16px}.faq-toggle{width:30px;height:30px}.faq-answer{padding-left:36px;padding-right:0}.faq-answer p{font-size:15px}.faq-help h2{font-size:25px}}
+.live-pill{display:inline-flex;align-items:center;gap:6px;margin-top:8px;border:1px solid #cfe3d2;background:#eef7ef;color:#0f7b3f;font-size:10px;letter-spacing:.1em;text-transform:uppercase;padding:4px 9px;cursor:pointer;font-family:inherit}
+.live-pill svg{width:12px;height:12px}
+.live-pill:before{content:'';width:6px;height:6px;border-radius:50%;background:#0f9d58;animation:livePulse 1.8s infinite}
+.live-pill.offline{border-color:#e8d3a8;background:#fdf3e2;color:#8a5a00}
+.live-pill.offline:before{background:#c98a00;animation:none}
+@keyframes livePulse{0%,100%{opacity:1}50%{opacity:.3}}
+.order-toast{position:fixed;right:24px;bottom:24px;z-index:60;display:flex;align-items:center;gap:9px;border:0;background:#a30000;color:#fff;padding:12px 18px;font-size:12px;letter-spacing:.03em;cursor:pointer;box-shadow:0 12px 30px rgba(0,0,0,.22);font-family:inherit}
+.order-toast svg{width:15px;height:15px}
+.order-toast:hover{background:#8f0000}
