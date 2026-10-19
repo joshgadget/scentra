@@ -1,6 +1,20 @@
-# Scentra - Luxury Fragrance Commerce
+# Scentra — Luxury Fragrance Commerce
 
-Scentra is a full-stack fragrance storefront with a React/Vite customer experience and an Express/Prisma administration API.
+Scentra is a full-stack fragrance storefront: a React 19/Vite customer experience, an Express 5 administration API, and a Prisma/PostgreSQL data layer. It supports a WhatsApp-first checkout, optional Paystack card payments, Supabase customer accounts, Brevo transactional email, and optional Twilio WhatsApp alerts.
+
+## What is included
+
+- Storefront with fragrance collections, product detail pages, search, cart, wishlist, delivery fees, promo codes, order tracking, and policy pages.
+- Customer accounts and order history through Supabase Auth.
+- Private admin workspace for products, inventory, orders, customers, coupons, analytics, and storefront settings.
+- Transactional email for receipts, order updates, owner alerts, and newsletter welcomes.
+- Demo mode that runs without a database or any third-party credentials.
+
+## Requirements
+
+- Node.js 20 or newer
+- npm 10 or newer
+- Optional: PostgreSQL or Supabase, Brevo, Paystack, Twilio
 
 ## Run locally
 
@@ -13,72 +27,173 @@ npm run dev
 - API health: `http://localhost:4000/api/health`
 - Admin: `http://localhost:5173/admin/login`
 
-The app works immediately in demo mode without environment variables. Demo checkout creates a paid test order without collecting money, so the storefront and admin flows can be tested before Paystack is configured.
+No environment variables are required for demo mode. The API serves the bundled catalogue from a local demo store, and checkout saves the order with a `PENDING` status before opening WhatsApp. No money is collected in demo mode.
 
-Default local admin:
+Default local admin for demo/development only:
 
 - Email: `admin@scentra.co`
 - Password: `Scentra123!`
 
-## Database and accounts (Supabase)
+Those defaults are disabled when `NODE_ENV=production` or when running a Vercel preview/production deployment. A fresh production deployment requires `JWT_SECRET` plus either `ADMIN_PASSWORD` or `ADMIN_PASSWORD_HASH` to seed the first admin.
 
-Scentra uses Supabase for both PostgreSQL persistence and customer accounts (Auth). Set these in `apps/api/.env` (start from `apps/api/.env.example`) and in the Vercel project:
+## Environment variables
 
-- `DATABASE_URL` - Supabase transaction pooler connection string (Prisma runtime).
-- `DATABASE_URL_UNPOOLED` - Supabase direct connection used by Prisma schema commands.
-- `SUPABASE_URL` - your project URL, e.g. `https://abcdefgh.supabase.co`.
-- `SUPABASE_ANON_KEY` - public anon key (safe server-side and in frontend builds).
-- `SUPABASE_SERVICE_ROLE_KEY` - server only, used to create accounts. Never expose this to the frontend.
-- `SUPABASE_JWT_SECRET` - Auth > JWT settings secret, used to verify customer sessions without a network round trip.
-- `JWT_SECRET`, `ADMIN_EMAIL`, and `ADMIN_PASSWORD` still secure the administration area.
+Start from [`apps/api/.env.example`](apps/api/.env.example) and create `apps/api/.env`. Set the same values in the hosting provider (Vercel Project → Settings → Environment Variables).
 
-Customer signup and sign-in go through Supabase Auth (proxied by the API at `/api/auth/signup`, `/api/auth/login`, and `/api/auth/refresh`), so passwords are never stored in the Scentra database. Order history is available at `/account` after signing in with the same email used at checkout.
+| Variable | Purpose |
+| --- | --- |
+| `PORT` | Local API port; defaults to `4000`. |
+| `APP_URL` | Public storefront URL used in emails and Paystack callbacks. |
+| `DATABASE_URL` | PostgreSQL connection string. A Supabase pooler URL works well. |
+| `DATABASE_URL_UNPOOLED` | Direct PostgreSQL connection used by Prisma schema commands. |
+| `JWT_SECRET` | Signing secret for admin sessions. Required in production. |
+| `ADMIN_EMAIL` | Admin account email; defaults to `admin@scentra.co`. |
+| `ADMIN_PASSWORD` | Password used when the first database admin is seeded. |
+| `ADMIN_PASSWORD_HASH` | Pre-hashed bcrypt password; takes precedence over `ADMIN_PASSWORD`. |
+| `SUPABASE_URL` | Supabase project URL. |
+| `SUPABASE_ANON_KEY` | Public Supabase key used for password sign-in. |
+| `SUPABASE_SERVICE_ROLE_KEY` | Server-only key used to create accounts and upload images. Never expose it to the browser. |
+| `SUPABASE_JWT_SECRET` | Optional legacy HS256 secret for offline customer-session verification. |
+| `PAYSTACK_SECRET_KEY` | Enables Paystack checkout and the payment webhook. |
+| `BREVO_API_KEY` | Enables transactional email. |
+| `EMAIL_FROM` | Verified Brevo sender, for example `Scentra <scentraofficialhq@gmail.com>`. |
+| `EMAIL_REPLY_TO` | Optional reply-to address. Defaults to the sender address. |
+| `SUPPORT_EMAIL` | Support address shown in email footers. |
+| `OWNER_EMAIL` | Inbox for new-order alerts. Admin notification settings take precedence. |
+| `TWILIO_ACCOUNT_SID` | Optional Twilio account SID for owner WhatsApp alerts. |
+| `TWILIO_AUTH_TOKEN` | Optional Twilio auth token. |
+| `TWILIO_WHATSAPP_FROM` | Optional Twilio WhatsApp sender. |
+| `OWNER_WHATSAPP` | Owner WhatsApp number used as a fallback. |
+| `SCENTRA_DEMO_STORE` | Optional path for the local demo-store JSON file. |
+| `SUPABASE_UPLOAD_BUCKET` | Public Supabase Storage bucket for product images; defaults to `product-images`. |
 
-Setup steps:
+Frontend analytics are optional and configured separately in `apps/web/.env`:
 
-1. Create a project at supabase.com and copy the URL and keys above into your environment.
-2. Push the schema to Supabase:
+- `VITE_GA_ID` — Google Analytics measurement ID.
+- `VITE_META_PIXEL_ID` — Meta Pixel ID.
+
+### Production security checklist
+
+- Use a long random `JWT_SECRET`; the development fallback is rejected in production.
+- Set `ADMIN_PASSWORD` or `ADMIN_PASSWORD_HASH` before the database is first seeded.
+- Keep `SUPABASE_SERVICE_ROLE_KEY`, `PAYSTACK_SECRET_KEY`, `BREVO_API_KEY`, and Twilio credentials server-side.
+- Rotate the default local admin password before exposing an environment publicly.
+- Serve the storefront over HTTPS so customer and admin sessions are encrypted in transit.
+
+If an admin already exists in the database, changing `ADMIN_PASSWORD` does not rewrite that row. Update the admin password deliberately or remove the row and let the API reseed it with the new environment value.
+
+## Database and customer accounts
+
+Scentra uses Prisma with PostgreSQL. You can host the database on Supabase, Neon, Railway, or any PostgreSQL provider. Supabase is only required for customer accounts and image uploads.
+
+1. Create a PostgreSQL database or a Supabase project.
+2. Add the connection strings and Supabase keys to `apps/api/.env`.
+3. Generate Prisma Client and push the schema:
 
 ```bash
 npm run prisma:generate
 npm run db:push
 ```
 
-3. In Supabase Auth, enable the Email provider. Accounts created through the API are confirmed automatically.
+4. In Supabase Auth, enable the Email provider. Accounts created through the API are confirmed automatically.
 
-## Email notifications (Brevo)
+Customer signup and sign-in are proxied by `/api/auth/signup`, `/api/auth/login`, and `/api/auth/refresh`, so Scentra never stores customer passwords. Order history is available at `/account` when the customer signs in with the email used at checkout.
 
-Order emails are sent through [Brevo](https://www.brevo.com). In Brevo, add your sender address
-under **Senders, Domains & Dedicated IPs** and click the verification link Brevo emails you (no DNS
-changes needed to start; authenticating the domain later with DKIM/SPF improves deliverability).
-Then set these in the API environment (and in the Vercel project):
+`SUPABASE_JWT_SECRET` is optional. When it is absent, or when a project uses asymmetric signing keys, the API verifies the session through the Supabase Auth API instead.
 
-- `BREVO_API_KEY` - v3 API key from **SMTP & API, API Keys**. When it is missing, emails are
-  skipped and the API logs a warning instead of failing.
-- `EMAIL_FROM` - the sender verified in Brevo, e.g. `Scentra <scentraofficialhq@gmail.com>` (the default).
-- `EMAIL_REPLY_TO` - optional reply-to address (defaults to the `EMAIL_FROM` address).
-- `SUPPORT_EMAIL` - address shown in email footers (default `hello@scentra.co`).
-- `OWNER_EMAIL` - inbox that receives the new-order alert. Can also be set in Admin, Settings,
-  Notification settings, which takes precedence.
-- `APP_URL` - public storefront URL used in email links, e.g. `https://scentra.co`. Falls back
-  to the Vercel deployment URL, so set it for production.
+## Checkout and payments
+
+### Default: WhatsApp checkout
+
+1. The customer fills in the checkout form and places the order.
+2. The order is saved with `PENDING` status and appears under Admin → Orders.
+3. WhatsApp opens with the full order summary addressed to the owner's number.
+4. The team confirms stock, delivery, and payment on WhatsApp.
+
+Set the destination number in either place:
+
+- Admin → Settings → Notification settings → Owner WhatsApp.
+- Server environment: `OWNER_WHATSAPP` (fallback when nothing is saved in the admin).
+
+### Optional: Paystack
+
+Set `PAYSTACK_SECRET_KEY` to turn on Paystack checkout. The storefront then shows a secure payment option instead of the "coming soon" notice. After the order is created, the customer is redirected to Paystack; a successful payment returns them to `/checkout/success`.
+
+Configure the webhook in the Paystack dashboard:
+
+```text
+https://your-domain.com/api/payments/paystack/webhook
+```
+
+The API verifies the Paystack signature, checks that the paid amount and currency match the order, and moves only `PENDING` orders to `PAID`, so repeated webhook deliveries are safe.
+
+## Email notifications
+
+Order email is sent through [Brevo](https://www.brevo.com). Add your sender address under **Senders, Domains & Dedicated IPs** and verify it before enabling email. Domain authentication with DKIM/SPF improves deliverability but is not required to start.
+
+Set `BREVO_API_KEY`, `EMAIL_FROM`, and optionally `EMAIL_REPLY_TO`, `SUPPORT_EMAIL`, and `OWNER_EMAIL`. When `BREVO_API_KEY` is missing, email is skipped and the API logs a warning instead of failing the order.
 
 Emails sent automatically:
 
-- Payment receipt to the customer when Paystack confirms a payment, or when an admin marks an
-  order Paid.
-- "We have your order" confirmation to the customer for bank-transfer (WhatsApp) orders.
-- Order status updates - Processing, Shipped, Delivered and Cancelled - when an admin changes the
-  status.
+- Payment receipt when Paystack confirms payment or an admin marks an order `PAID`.
+- "We have your order" confirmation for WhatsApp/bank-transfer orders.
+- Processing, shipped, delivered, and cancelled status updates.
 - New-order alert to the owner.
-- Newsletter welcome with the `WELCOME10` promo code for new subscribers.
+- Newsletter welcome with the `WELCOME10` promo code.
 
-Add the same variables in Vercel under Project, Settings, Environment Variables (Production and
-Preview), then redeploy. `GET /api/health` reports `email.provider` and `email.ready`.
+`GET /api/health` reports `email.provider` and `email.ready`.
 
-## Optional integrations
+## Optional WhatsApp alerts
 
-- `TWILIO_*` and `OWNER_WHATSAPP` enable optional WhatsApp alerts.
+`TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_WHATSAPP_FROM`, and `OWNER_WHATSAPP` enable owner alerts through Twilio. The storefront WhatsApp link works without Twilio.
+
+## Admin
+
+Visit `/admin/login`. The workspace includes:
+
+- **Overview** and **Analytics** — revenue, order counts, pending orders, low stock, and a seven-day revenue chart.
+- **Products** — create, edit, and delete fragrances, including note family, sizes, prices, stock, images, and sale flags.
+- **Orders** — review details and move orders through `PENDING`, `PAID`, `PROCESSING`, `SHIPPED`, `DELIVERED`, and `CANCELLED`.
+- **Customers** and **Coupons** — customer profiles, lifetime value, promo codes, usage limits, and expiry dates.
+- **Settings** — homepage announcement and hero copy, order-notification email and WhatsApp number, and delivery fees.
+
+Admin sessions use a signed JWT. Admin login, customer login/signup, newsletter signup, order creation, and order lookup have basic in-process rate limits.
+
+## Catalogue grouping
+
+The shop groups the catalogue by **brand** or **fragrance note** (Floral, Woody, Amber & Oriental, Fresh, Gourmand, and so on) using the "Group by" selector. Each product's note family is editable in Admin → Products.
+
+## Data sources and demo mode
+
+`GET /api/health` reports the active data source:
+
+- `database: "postgresql"` — products, orders, customers, coupons, and settings come from PostgreSQL.
+- `database: "demo"` — the API is serving the local demo store; no database is required.
+
+The demo store is a JSON file at `apps/api/.data/demo-store.json` by default. Override it with `SCENTRA_DEMO_STORE`, or use `/tmp/scentra-demo-store/demo-store.json` when the application directory is read-only. Admin changes survive local API restarts.
+
+If PostgreSQL becomes unavailable, the API falls back to the demo store and never pretends a database write succeeded. Once a demo-store write happens, the running process will not switch back to PostgreSQL because doing so could discard those edits. With no local edits, the API probes the database and reconnects automatically.
+
+To deliberately return to the database:
+
+1. Fix the connection and check `DATABASE_URL`.
+2. Delete `apps/api/.data/demo-store.json` if you do not need the demo changes.
+3. Restart the API.
+
+On Vercel, the demo store is written under `/tmp` and is ephemeral and instance-local. Use PostgreSQL for durable production data.
+
+Storefront content from `/api/storefront`, `/api/products`, and `/api/content` is sent with `no-store` so admin edits appear immediately.
+
+## Deployment
+
+The repository is configured for Vercel:
+
+- Build command: `npm run build`
+- Output directory: `apps/web/dist`
+- API adapter: [`api/index.js`](api/index.js), reachable under `/api/*`
+- SPA fallback: all non-API routes render `index.html`
+
+Set the environment variables from the table above in Vercel for Production and Preview, set `APP_URL` to the public storefront URL, then redeploy. Point the Paystack webhook at the production domain and confirm `GET /api/health` shows the expected database, email, and security status.
 
 ## Verify
 
@@ -86,62 +201,30 @@ Preview), then redeploy. `GET /api/health` reports `email.provider` and `email.r
 npm run build
 ```
 
-The repository is configured for Vercel with the Vite output in `apps/web/dist` and the Express API exposed through `api/index.js`.
+For a local smoke test:
 
-## How ordering works
+```bash
+npm run dev
+curl http://localhost:4000/api/health
+```
 
-Online card payment is not live yet, so checkout is built around WhatsApp:
-
-1. The customer fills in the checkout form and taps **Place order**.
-2. The order is saved to the store (it appears under Admin, Orders) and WhatsApp opens with the full order summary addressed to the owner's number.
-3. The team confirms stock, delivery and payment on WhatsApp.
-
-Set the destination number in either place:
-
-- Admin: Settings, Notification settings, Owner WhatsApp.
-- Server env: `OWNER_WHATSAPP` in `apps/api/.env` (fallback when nothing is saved in the admin).
-
-When you are ready to take card, transfer and USSD payments, add `PAYSTACK_SECRET_KEY`; checkout then shows the Paystack option instead of the "coming soon" notice.
-
-## Admin
-
-`/admin/login` (default `admin@scentra.co` / `admin`) opens the private workspace:
-
-- **Overview** and **Analytics**: revenue, order counts, pending orders, low stock.
-- **Products**: create, edit and delete fragrances, including the fragrance note family used for shop grouping, sizes, prices and stock.
-- **Orders**: review order details and move orders through Pending, Paid, Processing, Shipped, Delivered and Cancelled.
-- **Customers**, **Coupons**: customer list and promo codes.
-- **Settings**: homepage announcement, hero copy, order-notification email and WhatsApp number, and delivery fees.
-
-## Catalogue grouping
-
-The shop groups the catalogue by **brand** or by **fragrance note** (Floral, Woody, Amber & Oriental, Fresh, Gourmand and so on) using the "Group by" selector. Branded perfumes default to note grouping so shoppers can browse a house by the kind of scent they want. Each product's note family is editable in Admin, Products.
+The build runs Prisma Client generation and a production Vite build. There is no automated test suite yet.
 
 ## Pages
 
 - `/privacy` and `/terms` hold the policy pages.
+- `/track` looks up an order by number.
+- `/account` shows customer order history after Supabase sign-in.
 - Unknown URLs render a custom 404 page with search and shortcuts.
 
-## Admin data, demo mode and the local demo store
+## Project structure
 
-The API always tells you which data source the admin is using: `GET /api/health` returns
-`database: "postgresql"` when PostgreSQL is reachable and `database: "demo"` when the API is
-serving the local demo store. The admin header shows the same thing as a banner.
-
-- **PostgreSQL connected** - everything (products, orders, customers, coupons, settings) is read
-  from and written to the database.
-- **PostgreSQL not connected** - the API serves the local demo store instead of pretending a write
-  succeeded. The demo store is a plain JSON file, `apps/api/.data/demo-store.json` by default
-  (override with `SCENTRA_DEMO_STORE`, or `/tmp/scentra-demo-store/demo-store.json` when the app
-  directory is read-only). Admin changes are saved there so they survive page refreshes **and**
-  API restarts.
-
-A process that has fallen back to the demo store never switches back to PostgreSQL while it is
-running, because doing so would silently drop demo-store edits. To go back to the database:
-
-1. Fix the connection (check `DATABASE_URL` in the hosting environment variables).
-2. Delete `apps/api/.data/demo-store.json` if it holds demo changes you do not need.
-3. Restart the API.
-
-Storefront content (`/api/storefront`, `/api/products`, `/api/content`) is sent `no-store` so admin
-edits appear immediately instead of being served from a stale CDN copy.
+```text
+api/index.js                 Vercel serverless adapter
+apps/api/src/index.js        Express API, auth, checkout, admin, demo store
+apps/api/src/emails.js       Brevo HTML/text email templates
+apps/api/prisma/schema.prisma
+apps/web/src/main.jsx        Storefront and admin application
+apps/web/src/checkout.jsx    Checkout flow
+apps/web/src/wire.js         Runtime wiring, analytics, shared pages
+```

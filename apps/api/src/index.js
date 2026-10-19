@@ -13,7 +13,12 @@ import { sendEmail, emailStatus, supportEmail, paymentReceiptEmail, orderReceive
 
 const app = express()
 const port = process.env.PORT || 4000
-const appUrl = process.env.APP_URL || (process.env.VERCEL_URL ? 'https://' + process.env.VERCEL_URL : 'http://localhost:5173')
+const appUrl = (process.env.APP_URL || (process.env.VERCEL_URL ? 'https://' + process.env.VERCEL_URL : 'http://localhost:5173')).replace(/\/+$/, '')
+const isProduction = process.env.NODE_ENV === 'production' || ['production', 'preview'].includes(process.env.VERCEL_ENV)
+const configuredJwtSecret = String(process.env.JWT_SECRET || '').trim()
+const jwtSecret = () => configuredJwtSecret || (isProduction ? '' : 'dev-secret')
+const adminEmailAddress = () => String(process.env.ADMIN_EMAIL || 'admin@scentra.co').trim().toLowerCase()
+const configuredAdminCredential = () => Boolean(String(process.env.ADMIN_PASSWORD || '').trim() || String(process.env.ADMIN_PASSWORD_HASH || '').trim()) || !isProduction
 // Connection strings pasted into a hosting dashboard can arrive wrapped in quotes or padded
 // with whitespace, which makes Prisma reject them even though the database is healthy.
 // Clean the value up first and fall back to any sibling variable the host provides.
@@ -129,9 +134,41 @@ const memorySettings = {
   notifications:{ ownerEmail:process.env.OWNER_EMAIL || '', ownerWhatsapp:process.env.OWNER_WHATSAPP || defaultSupportWhatsapp }
 }
 
-const allowedOrigins = new Set([appUrl, 'http://localhost:5173', 'http://127.0.0.1:5173'].filter(Boolean))
-app.use(cors({ origin:(origin, callback) => callback(null, !origin || allowedOrigins.has(origin)) }))
+const normalizeOrigin = (value) => { try { return new URL(String(value || '')).origin } catch { return '' } }
+const deploymentOrigin = process.env.VERCEL_PROJECT_PRODUCTION_URL || process.env.VERCEL_BRANCH_URL
+const allowedOrigins = new Set([appUrl, deploymentOrigin ? 'https://' + deploymentOrigin : '', 'http://localhost:5173', 'http://127.0.0.1:5173'].map(normalizeOrigin).filter(Boolean))
+app.disable('x-powered-by')
+app.use((_req, res, next) => {
+  res.set('X-Content-Type-Options', 'nosniff')
+  res.set('Referrer-Policy', 'strict-origin-when-cross-origin')
+  next()
+})
+app.use(cors({ origin:(origin, callback) => callback(null, !origin || allowedOrigins.has(normalizeOrigin(origin))) }))
 app.use(express.json({ limit:'6mb', verify:(req, _res, buffer) => { req.rawBody = buffer } }))
+
+// Small in-process limiter for auth and write endpoints. It is intentionally dependency-free;
+// serverless instances each track their own window, which still blocks ordinary brute-force loops.
+const rateLimitBuckets = new Map()
+const requestAddress = (req) => {
+  const forwarded = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim()
+  return forwarded || req.socket?.remoteAddress || 'unknown'
+}
+const rateLimit = (name, limit, windowMs) => (req, res, next) => {
+  const now = Date.now()
+  const key = name + ':' + requestAddress(req)
+  const current = rateLimitBuckets.get(key)
+  if (!current || current.resetAt <= now) {
+    rateLimitBuckets.set(key, { count:1, resetAt:now + windowMs })
+    if (rateLimitBuckets.size > 5000) for (const [bucketKey, bucket] of rateLimitBuckets) if (bucket.resetAt <= now) rateLimitBuckets.delete(bucketKey)
+    return next()
+  }
+  current.count += 1
+  if (current.count > limit) {
+    res.set('Retry-After', String(Math.max(1, Math.ceil((current.resetAt - now) / 1000))))
+    return res.status(429).json({ error:'Too many attempts. Please wait a few minutes and try again.' })
+  }
+  next()
+}
 app.use((_req, _res, next) => {
   // Data sources never switch mid-request: recovery lands on the next request, and only when the
   // demo store holds no edits that PostgreSQL does not have yet.
@@ -239,16 +276,21 @@ async function listProducts(query = {}) {
 
 async function ensureSeed() {
   if (!dbEnabled) return
-  const adminEmail = process.env.ADMIN_EMAIL || 'admin@scentra.co'
-  const adminPassword = process.env.ADMIN_PASSWORD || 'Scentra123!'
+  const adminEmail = adminEmailAddress()
+  const adminPassword = String(process.env.ADMIN_PASSWORD || '').trim()
+  const adminPasswordHash = String(process.env.ADMIN_PASSWORD_HASH || '').trim()
   const [admin, productCount, welcomeCoupon] = await Promise.all([
-    prisma.admin.findUnique({ where:{ email:adminEmail }, select:{ id:true } }),
+    prisma.admin.findFirst({ where:{ email:{ equals:adminEmail, mode:'insensitive' } }, select:{ id:true } }),
     prisma.product.count(),
     prisma.coupon.findUnique({ where:{ code:'WELCOME10' }, select:{ id:true } })
   ])
   if (!admin) {
-    const { default:bcrypt } = await import('bcryptjs')
-    await prisma.admin.create({ data:{ name:'Scentra Admin', email:adminEmail, password:await bcrypt.hash(adminPassword, 12) } })
+    const localDefaultPassword = isProduction ? '' : 'Scentra123!'
+    const password = adminPasswordHash || (adminPassword || localDefaultPassword
+      ? await (await import('bcryptjs')).default.hash(adminPassword || localDefaultPassword, 12)
+      : '')
+    if (password) await prisma.admin.create({ data:{ name:'Scentra Admin', email:adminEmail, password } })
+    else console.warn('No ADMIN_PASSWORD or ADMIN_PASSWORD_HASH is set, so no database admin was created. Set one in the hosting environment to enable admin sign-in.')
   }
   if (!welcomeCoupon) await prisma.coupon.create({ data:{ code:'WELCOME10', type:'percent', value:10, expiryDate:new Date('2027-12-31T23:59:59.000Z'), usageLimit:500, active:true } })
   if (productCount) {
@@ -274,7 +316,20 @@ async function restoreReservation(order, tx = prisma) {
 async function releaseExpiredReservations() {
   if (!dbEnabled) return
   const expired = await prisma.order.findMany({ where:{ status:'PENDING', reservationExpiresAt:{ lte:new Date() } }, include:{ items:true } })
-  for (const order of expired) { await restoreReservation(order); await prisma.order.update({ where:{ id:order.id }, data:{ status:'CANCELLED', reservationExpiresAt:null } }) }
+  for (const order of expired) {
+    // Claim the order before putting stock back so two overlapping sweeps cannot restore it twice.
+    await prisma.$transaction(async (tx) => {
+      const claimed = await tx.order.updateMany({ where:{ id:order.id, status:'PENDING', reservationExpiresAt:{ lte:new Date() } }, data:{ status:'CANCELLED', reservationExpiresAt:null } })
+      if (claimed.count) await restoreReservation(order, tx)
+    })
+  }
+}
+
+let lastReservationSweep = 0
+async function maybeReleaseExpiredReservations() {
+  if (!dbEnabled || Date.now() - lastReservationSweep < 5 * 60 * 1000) return
+  lastReservationSweep = Date.now()
+  try { await releaseExpiredReservations() } catch (error) { console.error('Reservation cleanup failed:', error.message) }
 }
 
 async function getSetting(key) {
@@ -328,7 +383,20 @@ const notifyStatusChange = async (order, previousStatus) => {
   if (message) await sendSafely(order.customerEmail, message)
 }
 const safeNotify = (order, paid = true) => notifyOrder(order, paid).catch((error) => console.error('Order notification failed:', error.message))
-const adminAuth = (req, res, next) => { try { const token = req.headers.authorization?.replace('Bearer ', ''); req.admin = jwt.verify(token, process.env.JWT_SECRET || 'dev-secret'); next() } catch { res.status(401).json({ error:'Unauthorized' }) } }
+const bearerToken = (req) => {
+  const header = String(req.headers.authorization || '')
+  return /^Bearer\s+\S+$/i.test(header) ? header.replace(/^Bearer\s+/i, '').trim() : ''
+}
+const adminAuth = (req, res, next) => {
+  const secret = jwtSecret()
+  if (!secret) return res.status(503).json({ error:'Administration is not configured. Set JWT_SECRET on the server.' })
+  try {
+    const payload = jwt.verify(bearerToken(req), secret, { algorithms:['HS256'] })
+    if (payload.role !== 'admin') throw new Error('Not an admin token')
+    req.admin = payload
+    next()
+  } catch { res.status(401).json({ error:'Unauthorized' }) }
+}
 const cachePublic = (res, seconds = 30) => res.set('Cache-Control', `public, max-age=0, s-maxage=${seconds}, stale-while-revalidate=${seconds * 10}`)
 // Anything an administrator can edit must never be served from a CDN cache, otherwise saved edits
 // keep showing the old copy on the storefront until the cache expires.
@@ -347,34 +415,42 @@ async function supabaseRequest(path, options = {}) {
 }
 
 async function ensureCustomerFor(auth) {
-  const name = auth.name || (auth.email ? auth.email.split('@')[0] : 'Scentra customer')
+  const email = String(auth.email || '').trim().toLowerCase()
+  const name = auth.name || (email ? email.split('@')[0] : 'Scentra customer')
   if (!dbEnabled) {
-    const existing = memoryCustomers.get(auth.email)
-    const customer = existing || { id:auth.email, name, email:auth.email, phone:null, createdAt:new Date().toISOString() }
-    memoryCustomers.set(auth.email, customer)
+    const existing = memoryCustomers.get(email)
+    const customer = existing || { id:email, name, email, phone:null, createdAt:new Date().toISOString() }
+    memoryCustomers.set(email, customer)
     if (!existing) persistDemoStore()
     return customer
   }
-  return prisma.customer.upsert({ where:{ email:auth.email }, update:{}, create:{ name, email:auth.email } })
+  return prisma.customer.upsert({ where:{ email }, update:{}, create:{ name, email } })
 }
 
 const customerAuth = async (req, res, next) => {
-  const token = req.headers.authorization?.replace('Bearer ', '')
+  const token = bearerToken(req)
   if (!token) return res.status(401).json({ error:'Please sign in to continue' })
   try {
     let payload
     if (process.env.SUPABASE_JWT_SECRET) {
-      payload = jwt.verify(token, process.env.SUPABASE_JWT_SECRET, { algorithms:['HS256'] })
-    } else if (supabaseReady) {
+      try { payload = jwt.verify(token, process.env.SUPABASE_JWT_SECRET, { algorithms:['HS256'] }) }
+      catch { /* Supabase projects using asymmetric signing keys still verify through the Auth API below. */ }
+    }
+    if (!payload && supabaseReady) {
       const user = await supabaseRequest('/auth/v1/user', { headers:{ apikey:process.env.SUPABASE_ANON_KEY, Authorization:`Bearer ${token}` } })
       payload = { sub:user.id, email:user.email, aud:user.aud }
-    } else {
-      return res.status(503).json({ error:'Customer accounts are not configured yet' })
     }
-    if (payload.aud !== 'authenticated' || !payload.sub) throw new Error('Invalid session')
+    if (!payload) {
+      if (!supabaseReady) return res.status(503).json({ error:'Customer accounts are not configured yet' })
+      throw new Error('Invalid session')
+    }
+    if (payload.aud !== 'authenticated' || !payload.sub || !payload.email) throw new Error('Invalid session')
     req.customer = { id:payload.sub, email:String(payload.email || '').toLowerCase() }
     next()
-  } catch (error) { res.status(401).json({ error:'Your session has expired. Please sign in again.' }) }
+  } catch (error) {
+    if (!supabaseReady) return res.status(503).json({ error:'Customer accounts are not configured yet' })
+    res.status(401).json({ error:'Your session has expired. Please sign in again.' })
+  }
 }
 
 const serializeOrder = (order) => ({ orderNumber:order.orderNumber, status:order.status, total:order.total, deliveryFee:order.deliveryFee || 0, createdAt:order.createdAt, items:order.items || [] })
@@ -382,7 +458,7 @@ const accountSchema = z.object({ name:z.string().trim().min(1).max(80), email:z.
 const signInSchema = z.object({ email:z.string().trim().toLowerCase().email(), password:z.string().min(8).max(100) })
 const refreshSchema = z.object({ refreshToken:z.string().trim().min(10).max(500) })
 
-app.post('/api/auth/signup', async (req, res) => {
+app.post('/api/auth/signup', rateLimit('signup', 10, 60 * 60 * 1000), async (req, res) => {
   const parsed = accountSchema.safeParse(req.body)
   if (!parsed.success) return res.status(400).json({ error:'Enter your name, a valid email and a password of at least 8 characters' })
   if (!supabaseReady || !process.env.SUPABASE_SERVICE_ROLE_KEY) return res.status(503).json({ error:'Accounts are not ready yet - connect Supabase to enable signup.' })
@@ -395,7 +471,7 @@ app.post('/api/auth/signup', async (req, res) => {
   } catch (error) { res.status(409).json({ error:error.message === 'User already registered' ? 'An account already exists for this email. Sign in instead.' : (error.message || 'Could not create your account') }) }
 })
 
-app.post('/api/auth/login', async (req, res) => {
+app.post('/api/auth/login', rateLimit('login', 20, 15 * 60 * 1000), async (req, res) => {
   const parsed = signInSchema.safeParse(req.body)
   if (!parsed.success) return res.status(400).json({ error:'Enter your email and a password of at least 8 characters' })
   if (!supabaseReady) return res.status(503).json({ error:'Accounts are not ready yet - connect Supabase to sign in.' })
@@ -407,7 +483,7 @@ app.post('/api/auth/login', async (req, res) => {
   } catch (error) { res.status(401).json({ error:error.message === 'Invalid login credentials' ? 'Incorrect email or password' : (error.message || 'Could not sign you in') }) }
 })
 
-app.post('/api/auth/refresh', async (req, res) => {
+app.post('/api/auth/refresh', rateLimit('refresh', 60, 15 * 60 * 1000), async (req, res) => {
   const parsed = refreshSchema.safeParse(req.body)
   if (!parsed.success) return res.status(400).json({ error:'Refresh token is missing' })
   if (!supabaseReady) return res.status(503).json({ error:'Accounts are not configured yet' })
@@ -436,10 +512,17 @@ app.get('/api/account/orders', customerAuth, async (req, res) => {
 
 async function listCustomers() {
   if (dbEnabled) return prisma.customer.findMany({ select:{ id:true, name:true, email:true, phone:true, createdAt:true, orders:{ select:{ id:true, orderNumber:true, total:true, status:true, createdAt:true } } }, orderBy:{ createdAt:'desc' } })
-  return [...new Set(memoryOrders.map((order) => order.customerEmail))].map((email) => {
-    const orders = memoryOrders.filter((order) => order.customerEmail === email)
-    return { id:email, email, name:orders[0].customerName, phone:orders[0].customerPhone, createdAt:orders[orders.length-1].createdAt, orders }
-  })
+  const customers = new Map()
+  for (const customer of memoryCustomers.values()) customers.set(customer.email, { ...customer, orders:[] })
+  for (const order of memoryOrders) {
+    const email = String(order.customerEmail || '').toLowerCase()
+    const customer = customers.get(email) || { id:email, email, name:order.customerName, phone:order.customerPhone, createdAt:order.createdAt, orders:[] }
+    customer.name ||= order.customerName
+    customer.phone ||= order.customerPhone
+    customer.orders.push({ id:order.id, orderNumber:order.orderNumber, total:order.total, status:order.status, createdAt:order.createdAt })
+    customers.set(email, customer)
+  }
+  return [...customers.values()].sort((left, right) => new Date(right.createdAt) - new Date(left.createdAt))
 }
 
 async function getSummary() {
@@ -451,10 +534,20 @@ async function getSummary() {
   return { revenue:paid._sum.total || 0, orders, pending, lowStock }
 }
 
-app.get('/api/health', (_, res) => cachePrivate(res).json({ ok:true, ...storeStatus(), email:emailStatus(), readyForLive:dbEnabled && Boolean(process.env.PAYSTACK_SECRET_KEY) && Boolean(process.env.JWT_SECRET) }))
+const publicStoreStatus = () => {
+  const status = storeStatus()
+  return { database:status.database, databaseConfigured:status.databaseConfigured, problem:status.problem }
+}
+app.get('/api/health', (_, res) => cachePrivate(res).json({
+  ok:true,
+  ...publicStoreStatus(),
+  email:emailStatus(),
+  security:{ adminTokenSecretConfigured:Boolean(configuredJwtSecret), adminCredentialConfigured:configuredAdminCredential() },
+  readyForLive:dbEnabled && Boolean(process.env.PAYSTACK_SECRET_KEY) && Boolean(jwtSecret())
+}))
 app.get('/api/config', async (_, res) => {
   const [delivery, notifications] = await Promise.all([getSetting('delivery'), getSetting('notifications')]).catch(() => [deliveryDefaults, {}])
-  cachePrivate(res).json({ paymentMode:process.env.PAYSTACK_SECRET_KEY ? 'live' : 'demo', paymentProvider:'Paystack', database:dbEnabled ? 'postgresql' : 'memory', accounts:{ provider:'supabase', ready:supabaseReady }, delivery:{ ...deliveryDefaults, ...delivery }, support:{ email:supportEmail(), whatsapp:(notifications?.ownerWhatsapp) || process.env.OWNER_WHATSAPP || defaultSupportWhatsapp } })
+  cachePrivate(res).json({ paymentMode:process.env.PAYSTACK_SECRET_KEY ? 'live' : 'demo', paymentProvider:'Paystack', database:dbEnabled ? 'postgresql' : 'demo', accounts:{ provider:'supabase', ready:supabaseReady }, delivery:{ ...deliveryDefaults, ...delivery }, support:{ email:supportEmail(), whatsapp:(notifications?.ownerWhatsapp) || process.env.OWNER_WHATSAPP || defaultSupportWhatsapp } })
 })
 app.get('/api/categories', (_, res) => cachePublic(res, 3600).json([
   { name:'Custom Perfumes', slug:'custom-perfumes', eyebrow:'Made by us', description:'Small-batch signatures blended in Lagos.' },
@@ -466,7 +559,7 @@ app.get('/api/storefront', async (_, res) => { try { const [products, content] =
 app.get('/api/products', async (req, res) => { try { cacheLive(res).json(await listProducts(req.query)) } catch { res.status(500).json({ error:'Could not load products' }) } })
 app.get('/api/products/:slug', async (req, res) => { const product = (await listProducts()).find((item) => item.slug === req.params.slug); product ? cacheLive(res).json(product) : res.status(404).json({ error:'Product not found' }) })
 app.get('/api/content', async (_, res) => cacheLive(res).json(await getSetting('content')))
-app.post('/api/newsletter', async (req, res) => {
+app.post('/api/newsletter', rateLimit('newsletter', 10, 60 * 60 * 1000), async (req, res) => {
   const parsed = z.string().email().safeParse(req.body?.email)
   if (!parsed.success) return res.status(400).json({ error:'Enter a valid email address' })
   const email = parsed.data.toLowerCase()
@@ -488,16 +581,17 @@ const resolveSeedLine = (item) => {
 }
 
 const orderSchema = z.object({
-  customer:z.object({ name:z.string().min(2), email:z.string().email(), phone:z.string().min(7) }),
-  shippingAddress:z.object({ address:z.string().min(5), city:z.string().min(2), state:z.string().min(2), note:z.string().optional() }),
+  customer:z.object({ name:z.string().trim().min(2).max(120), email:z.string().trim().toLowerCase().email(), phone:z.string().trim().min(7).max(30) }),
+  shippingAddress:z.object({ address:z.string().trim().min(5).max(500), city:z.string().trim().min(2).max(120), state:z.string().trim().min(2).max(120), note:z.string().trim().max(500).optional() }),
   items:z.array(z.object({ productId:z.string(), variantId:z.string(), name:z.string(), size:z.string(), qty:z.number().int().positive(), price:z.number().int().nonnegative() })).min(1),
   couponCode:z.string().optional()
 })
 
-app.post('/api/orders', async (req, res) => {
+app.post('/api/orders', rateLimit('orders', 20, 10 * 60 * 1000), async (req, res) => {
   const parsed = orderSchema.safeParse(req.body)
   if (!parsed.success) return res.status(400).json({ error:'Please check your checkout details', details:parsed.error.flatten() })
   const body = parsed.data
+  await maybeReleaseExpiredReservations()
   const number = await uniqueOrderNumber()
   let order
   try {
@@ -514,6 +608,7 @@ app.post('/api/orders', async (req, res) => {
       const { discount, coupon } = await calculateCoupon(body.couponCode, subtotal)
       const deliveryFee = await deliveryFor(subtotal, discount, body.shippingAddress.state || '')
       const reserved = []
+      let couponClaimed = false
       try {
         for (const item of items) {
           const result = await prisma.productVariant.updateMany({ where:{ id:item.variantId, stock:{ gte:item.qty } }, data:{ stock:{ decrement:item.qty } } })
@@ -521,11 +616,19 @@ app.post('/api/orders', async (req, res) => {
           reserved.push(item)
         }
         const customer = await prisma.customer.upsert({ where:{ email:body.customer.email }, update:{ name:body.customer.name, phone:body.customer.phone }, create:{ name:body.customer.name, email:body.customer.email, phone:body.customer.phone } })
-        if (coupon) await prisma.coupon.update({ where:{ id:coupon.id }, data:{ usedCount:{ increment:1 } } })
+        if (coupon) {
+          const usageFilter = coupon.usageLimit == null ? {} : { OR:[{ usageLimit:null }, { usedCount:{ lt:coupon.usageLimit } }] }
+          const claimedCoupon = await prisma.coupon.updateMany({
+            where:{ id:coupon.id, active:true, ...usageFilter },
+            data:{ usedCount:{ increment:1 } }
+          })
+          if (!claimedCoupon.count) throw new Error('This promo code has reached its usage limit')
+          couponClaimed = true
+        }
         order = await prisma.order.create({ data:{ orderNumber:number, customerId:customer.id, customerName:body.customer.name, customerEmail:body.customer.email, customerPhone:body.customer.phone, shippingAddress:body.shippingAddress, subtotal, discount, deliveryFee, couponCode:coupon?.code, total:subtotal-discount+deliveryFee, reservationExpiresAt:process.env.PAYSTACK_SECRET_KEY ? new Date(Date.now() + 30 * 60 * 1000) : null, items:{ create:items } }, include:{ items:true } })
       } catch (error) {
         for (const done of reserved) await prisma.productVariant.update({ where:{ id:done.variantId }, data:{ stock:{ increment:done.qty } } }).catch(() => {})
-        if (coupon) await prisma.coupon.update({ where:{ id:coupon.id }, data:{ usedCount:{ decrement:1 } } }).catch(() => {})
+        if (couponClaimed) await prisma.coupon.update({ where:{ id:coupon.id }, data:{ usedCount:{ decrement:1 } } }).catch(() => {})
         throw error
       }
     } else {
@@ -575,19 +678,29 @@ app.post('/api/payments/paystack/webhook', async (req, res) => {
   }
   if (req.body.event !== 'charge.success') return res.sendStatus(200)
   const reference = req.body.data?.reference
+  const paidAmount = Number(req.body.data?.amount)
+  const paidCurrency = String(req.body.data?.currency || 'NGN').toUpperCase()
   try {
     if (dbEnabled) {
       const current = await prisma.order.findUnique({ where:{ orderNumber:reference }, include:{ items:true } })
+      if (current && (paidAmount !== current.total * 100 || paidCurrency !== 'NGN')) {
+        console.error(`Paystack amount mismatch for ${reference}: expected ${current.total * 100} NGN kobo, received ${paidAmount} ${paidCurrency}`)
+        return res.sendStatus(200)
+      }
       if (current && current.status === 'PENDING') { const order = await prisma.order.update({ where:{ id:current.id }, data:{ status:'PAID', paymentReference:reference, reservationExpiresAt:null }, include:{ items:true } }); await notifyOrder(order, true, { paymentChannel:req.body.data?.channel }) }
     } else {
       const order = memoryOrders.find((item) => item.orderNumber === reference)
+      if (order && (paidAmount !== order.total * 100 || paidCurrency !== 'NGN')) {
+        console.error(`Paystack amount mismatch for ${reference}: expected ${order.total * 100} NGN kobo, received ${paidAmount} ${paidCurrency}`)
+        return res.sendStatus(200)
+      }
       if (order && order.status === 'PENDING') { order.status = 'PAID'; order.paymentReference = reference; persistDemoStore(); await notifyOrder(order, true, { paymentChannel:req.body.data?.channel }) }
     }
   } catch (error) { console.error('Webhook handling failed:', error.message) }
   res.sendStatus(200)
 })
 
-app.get('/api/orders/:reference/status', async (req, res) => {
+app.get('/api/orders/:reference/status', rateLimit('order-lookup', 60, 10 * 60 * 1000), async (req, res) => {
   const reference = String(req.params.reference || '').trim()
   try {
     const raw = dbEnabled
@@ -601,35 +714,107 @@ app.get('/api/orders/:reference/status', async (req, res) => {
   }
 })
 
-app.post('/api/admin/login', async (req, res) => {
-  const { email, password } = req.body
+let fallbackPasswordHash
+app.post('/api/admin/login', rateLimit('admin-login', 10, 15 * 60 * 1000), async (req, res) => {
+  const email = String(req.body?.email || '').trim().toLowerCase()
+  const password = String(req.body?.password || '')
+  if (!email || !password) return res.status(400).json({ error:'Enter your email and password' })
+  const secret = jwtSecret()
+  if (!secret) return res.status(503).json({ error:'Administration is not configured. Set JWT_SECRET on the server.' })
   let valid = false
   let name = 'Scentra Admin'
   const { default:bcrypt } = await import('bcryptjs')
   let dbAdmin = null
-  if (dbEnabled) { try { dbAdmin = await prisma.admin.findUnique({ where:{ email } }) } catch (error) { degradeToMemory(error) } }
-  if (dbAdmin) { valid = await bcrypt.compare(password, dbAdmin.password); name = dbAdmin.name || name }
-  else { const expectedEmail = process.env.ADMIN_EMAIL || 'admin@scentra.co'; const passwordHash = process.env.ADMIN_PASSWORD_HASH || bcrypt.hashSync(process.env.ADMIN_PASSWORD || 'Scentra123!', 10); valid = String(email || '').toLowerCase() === expectedEmail.toLowerCase() && await bcrypt.compare(password, passwordHash) }
+  if (dbEnabled) { try { dbAdmin = await prisma.admin.findFirst({ where:{ email:{ equals:email, mode:'insensitive' } } }) } catch (error) { degradeToMemory(error) } }
+  try {
+    if (dbAdmin) {
+      valid = await bcrypt.compare(password, dbAdmin.password)
+      name = dbAdmin.name || name
+    } else {
+      const localDefaultPassword = isProduction ? '' : 'Scentra123!'
+      const configuredPassword = String(process.env.ADMIN_PASSWORD || '').trim()
+      const configuredHash = String(process.env.ADMIN_PASSWORD_HASH || '').trim()
+      if (!fallbackPasswordHash && (configuredHash || configuredPassword || localDefaultPassword)) {
+        fallbackPasswordHash = configuredHash || bcrypt.hashSync(configuredPassword || localDefaultPassword, 10)
+      }
+      valid = email === adminEmailAddress() && Boolean(fallbackPasswordHash) && await bcrypt.compare(password, fallbackPasswordHash)
+    }
+  } catch {
+    valid = false
+  }
   if (!valid) return res.status(401).json({ error:'Invalid credentials' })
-  res.json({ token:jwt.sign({ email, role:'admin' }, process.env.JWT_SECRET || 'dev-secret', { expiresIn:'2d' }), admin:{ email, name } })
+  res.json({ token:jwt.sign({ email, role:'admin' }, secret, { expiresIn:'2d' }), admin:{ email, name } })
 })
 
 app.get('/api/admin/orders', adminAuth, async (_, res) => res.json(dbEnabled ? await prisma.order.findMany({ include:{ items:true }, orderBy:{ createdAt:'desc' } }) : memoryOrders))
+const orderStatus = z.enum(['PENDING', 'PAID', 'PROCESSING', 'SHIPPED', 'DELIVERED', 'CANCELLED'])
+const restoreDemoReservation = (order) => {
+  for (const item of order.items || []) {
+    const product = seedProducts.find((entry) => entry.id === item.productId)
+    const variant = product?.variants.find((entry) => entry.id === item.variantId)
+    if (variant) variant.stock += item.qty
+  }
+  if (order.couponCode) {
+    const coupon = memoryCoupons.find((item) => item.code === order.couponCode)
+    if (coupon && coupon.usedCount > 0) coupon.usedCount -= 1
+  }
+}
 app.patch('/api/admin/orders/:id', adminAuth, async (req, res) => {
+  const parsedStatus = orderStatus.safeParse(req.body?.status)
+  if (!parsedStatus.success) return res.status(400).json({ error:'Choose a valid order status' })
+  const nextStatus = parsedStatus.data
   if (!dbEnabled) {
     const order = memoryOrders.find((item) => item.id === req.params.id)
-    if (order) { const previousStatus = order.status; order.status = req.body.status; persistDemoStore(); await notifyStatusChange(order, previousStatus).catch((error) => console.error('Order status email failed:', error.message)) }
-    return res.json(order || { ok:true })
+    if (!order) return res.status(404).json({ error:'Order not found' })
+    const previousStatus = order.status
+    if (nextStatus === 'CANCELLED' && previousStatus === 'PENDING') restoreDemoReservation(order)
+    order.status = nextStatus
+    persistDemoStore()
+    await notifyStatusChange(order, previousStatus).catch((error) => console.error('Order status email failed:', error.message))
+    return res.json(order)
   }
   const current = await prisma.order.findUnique({ where:{ id:req.params.id }, include:{ items:true } })
   if (!current) return res.status(404).json({ error:'Order not found' })
-  if (req.body.status === 'CANCELLED' && current.status === 'PENDING') await (async () => { await restoreReservation(current); await prisma.order.update({ where:{ id:current.id }, data:{ status:'CANCELLED', reservationExpiresAt:null } }) })()
-  else await prisma.order.update({ where:{ id:current.id }, data:{ status:req.body.status, reservationExpiresAt:req.body.status === 'PAID' ? null : undefined } })
+  if (nextStatus === 'CANCELLED' && current.status === 'PENDING') await (async () => { await restoreReservation(current); await prisma.order.update({ where:{ id:current.id }, data:{ status:'CANCELLED', reservationExpiresAt:null } }) })()
+  else await prisma.order.update({ where:{ id:current.id }, data:{ status:nextStatus, reservationExpiresAt:nextStatus === 'PAID' ? null : undefined } })
   const updated = await prisma.order.findUnique({ where:{ id:current.id }, include:{ items:true } })
   await notifyStatusChange(updated, current.status).catch((error) => console.error('Order status email failed:', error.message))
   res.json(updated)
 })
 app.get('/api/admin/products', adminAuth, async (_, res) => res.json(await listProducts()))
+const productVariantInput = z.object({
+  id:z.string().trim().min(1).max(200).optional(),
+  size:z.string().trim().min(1).max(40),
+  price:z.coerce.number().int().nonnegative().max(1_000_000_000),
+  stock:z.coerce.number().int().nonnegative().max(1_000_000_000)
+})
+const productInput = z.object({
+  name:z.string().trim().min(1).max(160),
+  slug:z.string().trim().max(160).optional(),
+  description:z.string().trim().max(10_000).optional(),
+  metaDescription:z.string().trim().max(500).optional(),
+  brand:z.string().trim().max(120).optional(),
+  gender:z.string().trim().max(40).optional(),
+  note:z.string().trim().max(80).optional(),
+  category:z.string().trim().max(120).optional(),
+  categorySlug:z.string().trim().max(120).optional(),
+  images:z.array(z.string().trim().min(1).max(2_000)).max(20).optional(),
+  image:z.string().trim().max(2_000).optional(),
+  scentNotes:z.record(z.string(), z.any()).optional(),
+  featured:z.boolean().optional(),
+  onSale:z.boolean().optional(),
+  variants:z.array(productVariantInput).min(1).max(50).optional(),
+  size:z.string().trim().max(40).optional(),
+  price:z.coerce.number().int().nonnegative().max(1_000_000_000).optional(),
+  stock:z.coerce.number().int().nonnegative().max(1_000_000_000).optional()
+})
+app.use('/api/admin/products', (req, res, next) => {
+  if (!['POST', 'PATCH'].includes(req.method)) return next()
+  const parsed = (req.method === 'POST' ? productInput : productInput.partial()).safeParse(req.body)
+  if (!parsed.success) return res.status(400).json({ error:'Check the product details and try again', details:parsed.error.flatten() })
+  req.body = parsed.data
+  next()
+})
 app.post('/api/admin/products', adminAuth, async (req, res) => {
   const body = req.body
   const categorySlug = body.categorySlug || 'custom-perfumes'
@@ -640,14 +825,128 @@ app.post('/api/admin/products', adminAuth, async (req, res) => {
   const product = await prisma.product.create({ data:{ name:body.name, slug:body.slug || slugify(body.name), description:body.description || '', metaDescription:body.metaDescription || '', brand:body.brand || 'SCENTRA', gender:body.gender || 'unisex', note:body.note || '', images, scentNotes:body.scentNotes || {}, categoryId:category.id, featured:Boolean(body.featured), onSale:Boolean(body.onSale), variants:{ create:variants.map(({size,price,stock})=>({size,price,stock})) } }, include:{ category:true, variants:true } })
   res.status(201).json({ ...product, category:product.category.name, categorySlug:product.category.slug })
 })
-app.patch('/api/admin/products/:id', adminAuth, async (req, res) => { const body=req.body; if (!dbEnabled) { const product=seedProducts.find((item)=>item.id===req.params.id); if(!product)return res.status(404).json({error:'Product not found'}); Object.assign(product,{name:body.name??product.name,slug:body.slug??product.slug,description:body.description??product.description,metaDescription:body.metaDescription??product.metaDescription,brand:body.brand??product.brand,gender:body.gender??product.gender,note:body.note??product.note,images:Array.isArray(body.images)?body.images:product.images,featured:body.featured??product.featured,onSale:body.onSale??product.onSale}); if(body.variants)product.variants=body.variants.map((variant,index)=>({...variant,id:variant.id||`variant-${Date.now()}-${index}`,price:Number(variant.price),stock:Number(variant.stock)})); persistDemoStore(); return res.json(product) } const data={}; for(const key of ['name','slug','description','metaDescription','brand','gender','note','featured','onSale'])if(body[key]!==undefined)data[key]=body[key];if(Array.isArray(body.images))data.images=body.images; await prisma.product.update({where:{id:req.params.id},data}); if(body.variants)for(const variant of body.variants){if(variant.id)await prisma.productVariant.update({where:{id:variant.id},data:{size:variant.size,price:Number(variant.price),stock:Number(variant.stock)}});else await prisma.productVariant.create({data:{productId:req.params.id,size:variant.size,price:Number(variant.price),stock:Number(variant.stock)}})} const product=await prisma.product.findUnique({where:{id:req.params.id},include:{category:true,variants:true}});res.json({...product,category:product.category.name,categorySlug:product.category.slug}) })
-app.delete('/api/admin/products/:id', adminAuth, async (req, res) => { if (!dbEnabled) { const index = seedProducts.findIndex((item) => item.id === req.params.id); if (index >= 0) { seedProducts.splice(index, 1); persistDemoStore() } return res.sendStatus(204) } await prisma.product.delete({ where:{ id:req.params.id } }); res.sendStatus(204) })
+app.patch('/api/admin/products/:id', adminAuth, async (req, res) => {
+  const body = req.body
+  const categorySlugs = { 'Custom Perfume':'custom-perfumes', 'Branded Perfume':'branded-perfumes', 'Body Spray':'body-sprays', Deodorant:'deodorants' }
+  const resolvedCategorySlug = body.categorySlug || categorySlugs[body.category] || (body.category ? slugify(body.category) : '')
+  if (!dbEnabled) {
+    const product = seedProducts.find((item) => item.id === req.params.id)
+    if (!product) return res.status(404).json({ error:'Product not found' })
+    Object.assign(product, {
+      name:body.name ?? product.name,
+      slug:body.slug ?? product.slug,
+      description:body.description ?? product.description,
+      metaDescription:body.metaDescription ?? product.metaDescription,
+      brand:body.brand ?? product.brand,
+      gender:body.gender ?? product.gender,
+      note:body.note ?? product.note,
+      category:body.category ?? product.category,
+      categorySlug:resolvedCategorySlug || product.categorySlug,
+      images:Array.isArray(body.images) ? body.images : product.images,
+      scentNotes:body.scentNotes ?? product.scentNotes,
+      featured:body.featured ?? product.featured,
+      onSale:body.onSale ?? product.onSale
+    })
+    if (body.variants) product.variants = body.variants.map((variant, index) => ({ ...variant, id:variant.id || `variant-${Date.now()}-${index}`, price:Number(variant.price), stock:Number(variant.stock) }))
+    persistDemoStore()
+    return res.json(product)
+  }
+  const data = {}
+  for (const key of ['name', 'slug', 'description', 'metaDescription', 'brand', 'gender', 'note', 'featured', 'onSale']) if (body[key] !== undefined) data[key] = body[key]
+  if (Array.isArray(body.images)) data.images = body.images
+  if (body.scentNotes !== undefined) data.scentNotes = body.scentNotes
+  if (body.category || body.categorySlug) {
+    const categoryName = body.category || 'Custom Perfume'
+    const categorySlug = resolvedCategorySlug || slugify(categoryName)
+    const category = await prisma.category.upsert({ where:{ slug:categorySlug }, update:{ name:categoryName }, create:{ name:categoryName, slug:categorySlug } })
+    data.categoryId = category.id
+  }
+  try {
+    await prisma.product.update({ where:{ id:req.params.id }, data })
+    if (body.variants) for (const variant of body.variants) {
+      if (variant.id) {
+        const updated = await prisma.productVariant.updateMany({ where:{ id:variant.id, productId:req.params.id }, data:{ size:variant.size, price:Number(variant.price), stock:Number(variant.stock) } })
+        if (!updated.count) return res.status(409).json({ error:'One of those sizes no longer belongs to this product. Refresh and try again.' })
+      } else await prisma.productVariant.create({ data:{ productId:req.params.id, size:variant.size, price:Number(variant.price), stock:Number(variant.stock) } })
+    }
+  } catch (error) {
+    if (error?.code === 'P2025') return res.status(404).json({ error:'Product not found' })
+    if (error?.code === 'P2002') return res.status(409).json({ error:'A product with that URL slug already exists' })
+    throw error
+  }
+  const product = await prisma.product.findUnique({ where:{ id:req.params.id }, include:{ category:true, variants:true } })
+  res.json({ ...product, category:product.category.name, categorySlug:product.category.slug })
+})
+app.delete('/api/admin/products/:id', adminAuth, async (req, res) => {
+  if (!dbEnabled) {
+    const index = seedProducts.findIndex((item) => item.id === req.params.id)
+    if (index < 0) return res.status(404).json({ error:'Product not found' })
+    seedProducts.splice(index, 1)
+    persistDemoStore()
+    return res.sendStatus(204)
+  }
+  try {
+    await prisma.product.delete({ where:{ id:req.params.id } })
+    res.sendStatus(204)
+  } catch (error) {
+    if (error?.code === 'P2025') return res.status(404).json({ error:'Product not found' })
+    if (error?.code === 'P2003') return res.status(409).json({ error:'This product appears in an existing order. Set its stock to zero instead of deleting it.' })
+    throw error
+  }
+})
 app.get('/api/admin/customers', adminAuth, async (_, res) => cachePrivate(res).json(await listCustomers()))
 app.get('/api/admin/coupons', adminAuth, async (_, res) => res.json(dbEnabled ? await prisma.coupon.findMany({ orderBy:{ expiryDate:'desc' } }) : memoryCoupons))
-app.post('/api/admin/coupons', adminAuth, async (req, res) => { const data = { code:req.body.code.toUpperCase(), type:req.body.type, value:Number(req.body.value), expiryDate:new Date(req.body.expiryDate), usageLimit:req.body.usageLimit ? Number(req.body.usageLimit) : null, active:true }; if (!dbEnabled) { const coupon={ id:`coupon-${Date.now()}`, ...data, expiryDate:data.expiryDate.toISOString(), usedCount:0 }; memoryCoupons.unshift(coupon); persistDemoStore(); return res.status(201).json(coupon) } res.status(201).json(await prisma.coupon.create({ data })) })
-app.delete('/api/admin/coupons/:id', adminAuth, async (req, res) => { if (!dbEnabled) { const index=memoryCoupons.findIndex((item)=>item.id===req.params.id); if(index>=0){memoryCoupons.splice(index,1);persistDemoStore()} return res.sendStatus(204) } await prisma.coupon.delete({ where:{ id:req.params.id } }); res.sendStatus(204) })
+const couponInput = z.object({
+  code:z.string().trim().min(2).max(40).transform((value) => value.toUpperCase()),
+  type:z.enum(['percent', 'fixed']),
+  value:z.coerce.number().int().positive().max(10_000_000),
+  expiryDate:z.coerce.date(),
+  usageLimit:z.preprocess((value) => value === '' || value == null ? undefined : value, z.coerce.number().int().positive().optional())
+})
+app.post('/api/admin/coupons', adminAuth, async (req, res) => {
+  const parsed = couponInput.safeParse(req.body)
+  if (!parsed.success) return res.status(400).json({ error:'Enter a valid code, offer, expiry date and usage limit' })
+  if (parsed.data.type === 'percent' && parsed.data.value > 100) return res.status(400).json({ error:'A percentage discount cannot exceed 100%' })
+  const data = { ...parsed.data, usageLimit:parsed.data.usageLimit ?? null, active:true }
+  if (!dbEnabled) {
+    if (memoryCoupons.some((coupon) => coupon.code === data.code)) return res.status(409).json({ error:'A coupon with that code already exists' })
+    const coupon = { id:`coupon-${Date.now()}`, ...data, expiryDate:data.expiryDate.toISOString(), usedCount:0 }
+    memoryCoupons.unshift(coupon)
+    persistDemoStore()
+    return res.status(201).json(coupon)
+  }
+  try { res.status(201).json(await prisma.coupon.create({ data })) }
+  catch (error) {
+    if (error?.code === 'P2002') return res.status(409).json({ error:'A coupon with that code already exists' })
+    throw error
+  }
+})
+app.delete('/api/admin/coupons/:id', adminAuth, async (req, res) => {
+  if (!dbEnabled) {
+    const index = memoryCoupons.findIndex((item) => item.id === req.params.id)
+    if (index < 0) return res.status(404).json({ error:'Coupon not found' })
+    memoryCoupons.splice(index, 1)
+    persistDemoStore()
+    return res.sendStatus(204)
+  }
+  try { await prisma.coupon.delete({ where:{ id:req.params.id } }); res.sendStatus(204) }
+  catch (error) {
+    if (error?.code === 'P2025') return res.status(404).json({ error:'Coupon not found' })
+    throw error
+  }
+})
 app.get('/api/admin/settings', adminAuth, async (_, res) => res.json({ content:await getSetting('content'), notifications:await getSetting('notifications'), delivery:await getSetting('delivery') }))
-app.put('/api/admin/settings/:key', adminAuth, async (req, res) => { if (!['content','notifications','delivery'].includes(req.params.key)) return res.status(400).json({ error:'Unknown settings group' }); if (!dbEnabled) { memorySettings[req.params.key]={...memorySettings[req.params.key],...req.body}; persistDemoStore(); return res.json(memorySettings[req.params.key]) } const setting=await prisma.siteSetting.upsert({ where:{ key:req.params.key }, update:{ value:req.body }, create:{ key:req.params.key, value:req.body } }); res.json(setting.value) })
+app.put('/api/admin/settings/:key', adminAuth, async (req, res) => {
+  if (!['content', 'notifications', 'delivery'].includes(req.params.key)) return res.status(400).json({ error:'Unknown settings group' })
+  if (!req.body || typeof req.body !== 'object' || Array.isArray(req.body)) return res.status(400).json({ error:'Settings must be an object' })
+  if (!dbEnabled) {
+    memorySettings[req.params.key] = { ...memorySettings[req.params.key], ...req.body }
+    persistDemoStore()
+    return res.json(memorySettings[req.params.key])
+  }
+  const setting = await prisma.siteSetting.upsert({ where:{ key:req.params.key }, update:{ value:req.body }, create:{ key:req.params.key, value:req.body } })
+  res.json(setting.value)
+})
 app.get('/api/admin/summary', adminAuth, async (_, res) => cachePrivate(res).json(await getSummary()))
 app.get('/api/admin/dashboard', adminAuth, async (_, res) => {
   const load = async () => {

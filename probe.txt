@@ -1,3 +1,0 @@
-neon-pooler        OK    1184ms 
-supabase-pooler    OK     892ms 
-google             OK    2539ms 

@@ -4,11 +4,10 @@ dist
 .env.*
 !.env.example
 *.log
-
-
+.DS_Store
+.tmp-*
+*.corrupt
 .vercel
-.env*
-!.env.example
 
 # Local demo store used when PostgreSQL is not reachable
 apps/api/.data/

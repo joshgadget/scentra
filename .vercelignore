@@ -4,4 +4,5 @@ apps/web/dist
 *.log
 .env
 .env.*
-apps/web/src/main.jsx.corrupt
+.tmp-*
+*.corrupt

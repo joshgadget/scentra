@@ -49,11 +49,12 @@ export function applyMeta(pathname, products = [], content = {}) {
   const origin = window.location.origin
   const url = origin + (pathname === '/' ? '/' : pathname)
   const announcement = content.announcement || ''
+  const privatePath = pathname.startsWith('/admin') || pathname.startsWith('/account') || pathname === '/cart' || pathname.startsWith('/checkout') || pathname === '/track'
   let title = ''
   let description = ''
   let image = DEFAULT_IMAGE
   let jsonLd = null
-  let noindex = false
+  let noindex = privatePath
 
   if (pathname.startsWith('/admin')) {
     title = 'Admin · Scentra'
@@ -99,7 +100,7 @@ export function applyMeta(pathname, products = [], content = {}) {
     description = 'Review your Scentra order before checkout.'
   } else if (pathname === '/checkout' || pathname === '/checkout/success') {
     title = pathname === '/checkout/success' ? 'Order confirmed · Scentra' : 'Checkout · Scentra'
-    description = 'Secure checkout with Paystack.'
+    description = 'Review your Scentra order and complete payment securely.'
   } else if (pathname === '/track') {
     title = 'Track your order · Scentra'
     description = 'Enter your order number to see the latest delivery status.'
