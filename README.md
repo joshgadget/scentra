@@ -163,6 +163,10 @@ Admin sessions use a signed JWT. Admin login, customer login/signup, newsletter 
 
 The shop groups the catalogue by **brand** or **fragrance note** (Floral, Woody, Amber & Oriental, Fresh, Gourmand, and so on) using the "Group by" selector. Each product's note family is editable in Admin → Products.
 
+## Visual system
+
+The interface uses the Fragrances.com.ng-inspired design tokens in [`apps/web/src/theme.css`](apps/web/src/theme.css): Rajdhani typography, teal `#009BC2` primary actions, periwinkle `#5C6AC3` editorial bands, a cool `#F6F7F9` canvas, sharp flat cards, and pill-shaped primary buttons. The theme loads after the base and extras stylesheets so the same system applies to the storefront, checkout, account pages, tracking, and admin workspace.
+
 ## Data sources and demo mode
 
 `GET /api/health` reports the active data source:
@@ -226,5 +230,6 @@ apps/api/src/emails.js       Brevo HTML/text email templates
 apps/api/prisma/schema.prisma
 apps/web/src/main.jsx        Storefront and admin application
 apps/web/src/checkout.jsx    Checkout flow
+apps/web/src/theme.css       Fragrances-inspired design tokens and component theme
 apps/web/src/wire.js         Runtime wiring, analytics, shared pages
 ```

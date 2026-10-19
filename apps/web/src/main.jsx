@@ -28,7 +28,18 @@ function BrowserRouter({children}){const[location,setLocation]=useState(readBrow
 function useLocation(){return useContext(BrowserRouterContext).location}
 function useNavigate(){return useContext(BrowserRouterContext).navigate}
 function Link({to,onClick,target,children,...props}){const navigate=useNavigate();return <a {...props} href={to} target={target} onClick={event=>{onClick?.(event);if(event.defaultPrevented||event.button!==0||event.metaKey||event.ctrlKey||event.shiftKey||event.altKey||target==='_blank')return;event.preventDefault();navigate(to)}}>{children}</a>}
-function NavLink({to,end=false,className,children,...props}){const{pathname}=useLocation(),targetPath=new URL(to,window.location.origin).pathname.replace(/\/+$/,'')||'/',active=end?pathname===targetPath:pathname===targetPath||pathname.startsWith(`${targetPath}/`),resolved=typeof className==='function'?className({isActive:active}):[className,active?'active':''].filter(Boolean).join(' ');return <Link {...props} className={resolved} to={to}>{children}</Link>}
+function NavLink({to,end=false,className,children,...props}){
+ const{pathname,search}=useLocation()
+ const target=new URL(to,window.location.origin)
+ const targetPath=target.pathname.replace(/\/+$/,'')||'/'
+ const targetCategory=target.searchParams.get('category')
+ const currentCategory=new URLSearchParams(search).get('category')
+ const pathMatches=end?pathname===targetPath:pathname===targetPath||pathname.startsWith(`${targetPath}/`)
+ const searchMatches=targetCategory?currentCategory===targetCategory:currentCategory!=='custom-perfumes'
+ const active=pathMatches&&searchMatches
+ const resolved=typeof className==='function'?className({isActive:active}):[className,active?'active':''].filter(Boolean).join(' ')
+ return <Link {...props} className={resolved} to={to}>{children}</Link>
+}
 function Navigate({to,replace=false}){const navigate=useNavigate();useEffect(()=>navigate(to,{replace}),[to,replace]);return null}
 function Outlet(){return useContext(OutletContext)}
 function useParams(){return useContext(ParamsContext)}
